@@ -1,12 +1,13 @@
 from __future__ import absolute_import, unicode_literals
 
 import copy
+import datetime
 import traceback
 from contextlib import contextmanager
 
 import pytest
-from case import Mock, call, patch, skip
 
+from case import Mock, call, patch, skip
 from celery import states, uuid
 from celery.app.task import Context
 from celery.backends.base import SyncBackendMixin
@@ -84,6 +85,16 @@ class test_AsyncResult:
         def mytask():
             pass
         self.mytask = mytask
+
+    def test_forget(self):
+        first = Mock()
+        second = self.app.AsyncResult(self.task1['id'], parent=first)
+        third = self.app.AsyncResult(self.task2['id'], parent=second)
+        last = self.app.AsyncResult(self.task3['id'], parent=third)
+        last.forget()
+        first.forget.assert_called_once()
+        assert last.result is None
+        assert second.result is None
 
     def test_ignored_getter(self):
         result = self.app.AsyncResult(uuid())
@@ -173,7 +184,7 @@ class test_AsyncResult:
         )
         x.backend.READY_STATES = states.READY_STATES
         assert x.graph
-        assert x.get_leaf() is 2
+        assert x.get_leaf() == 2
 
         it = x.collect()
         assert list(it) == [
@@ -398,7 +409,7 @@ class test_AsyncResult:
 
         x = self.app.AsyncResult('1')
         request = Context(
-            task_name='foo',
+            task='foo',
             children=None,
             args=['one', 'two'],
             kwargs={'kwarg1': 'three'},
@@ -414,9 +425,23 @@ class test_AsyncResult:
         assert x.worker == 'foo'
         assert x.retries == 1
         assert x.queue == 'celery'
-        assert x.date_done is not None
+        assert isinstance(x.date_done, datetime.datetime)
         assert x.task_id == "1"
         assert x.state == "SUCCESS"
+        result = self.app.AsyncResult(self.task4['id'])
+        assert result.date_done is None
+
+    @pytest.mark.parametrize('result_dict, date', [
+        ({'date_done': None}, None),
+        ({'date_done': '1991-10-05T05:41:06'},
+         datetime.datetime(1991, 10, 5, 5, 41, 6)),
+        ({'date_done': datetime.datetime(1991, 10, 5, 5, 41, 6)},
+         datetime.datetime(1991, 10, 5, 5, 41, 6))
+    ])
+    def test_date_done(self, result_dict, date):
+        result = self.app.AsyncResult(uuid())
+        result._cache = result_dict
+        assert result.date_done == date
 
 
 class test_ResultSet:
@@ -749,7 +774,7 @@ class test_GroupResult:
         ts = self.app.GroupResult(uuid(), subs)
         ts.save()
         with pytest.raises(RuntimeError,
-                           message="Test depends on current_app"):
+                           match="Test depends on current_app"):
             GroupResult.restore(ts.id)
 
     def test_join_native(self):

@@ -10,6 +10,7 @@ import shelve
 import sys
 import time
 import traceback
+from calendar import timegm
 from collections import namedtuple
 from functools import total_ordering
 from threading import Event, Thread
@@ -26,7 +27,7 @@ from .five import (items, monotonic, python_2_unicode_compatible, reraise,
 from .schedules import crontab, maybe_schedule
 from .utils.imports import load_extension_class_names, symbol_by_name
 from .utils.log import get_logger, iter_open_logger_fds
-from .utils.time import humanize_seconds
+from .utils.time import humanize_seconds, maybe_make_aware
 
 __all__ = (
     'SchedulingError', 'ScheduleEntry', 'Scheduler',
@@ -44,6 +45,37 @@ DEFAULT_MAX_INTERVAL = 300  # 5 minutes
 
 class SchedulingError(Exception):
     """An error occurred while scheduling a task."""
+
+
+class BeatLazyFunc(object):
+    """An lazy function declared in 'beat_schedule' and called before sending to worker.
+
+    Example:
+
+        beat_schedule = {
+            'test-every-5-minutes': {
+                'task': 'test',
+                'schedule': 300,
+                'kwargs': {
+                    "current": BeatCallBack(datetime.datetime.now)
+                }
+            }
+        }
+
+    """
+
+    def __init__(self, func, *args, **kwargs):
+        self._func = func
+        self._func_params = {
+            "args": args,
+            "kwargs": kwargs
+        }
+
+    def __call__(self):
+        return self.delay()
+
+    def delay(self):
+        return self._func(*self._func_params["args"], **self._func_params["kwargs"])
 
 
 @total_ordering
@@ -253,12 +285,13 @@ class Scheduler(object):
     def is_due(self, entry):
         return entry.is_due()
 
-    def _when(self, entry, next_time_to_run, mktime=time.mktime):
+    def _when(self, entry, next_time_to_run, mktime=timegm):
+        """Return a utc timestamp, make sure heapq in currect order."""
         adjust = self.adjust
 
-        as_now = entry.default_now()
+        as_now = maybe_make_aware(entry.default_now())
 
-        return (mktime(as_now.timetuple()) +
+        return (mktime(as_now.utctimetuple()) +
                 as_now.microsecond / 1e6 +
                 (adjust(next_time_to_run) or 0))
 
@@ -317,6 +350,10 @@ class Scheduler(object):
         return min(adjust(next_time_to_run) or max_interval, max_interval)
 
     def schedules_equal(self, old_schedules, new_schedules):
+        if old_schedules is new_schedules is None:
+            return True
+        if old_schedules is None or new_schedules is None:
+            return False
         if set(old_schedules.keys()) != set(new_schedules.keys()):
             return False
         for name, old_entry in old_schedules.items():
@@ -330,9 +367,9 @@ class Scheduler(object):
     def should_sync(self):
         return (
             (not self._last_sync or
-               (monotonic() - self._last_sync) > self.sync_every) or
+             (monotonic() - self._last_sync) > self.sync_every) or
             (self.sync_every_tasks and
-                self._tasks_since_sync >= self.sync_every_tasks)
+             self._tasks_since_sync >= self.sync_every_tasks)
         )
 
     def reserve(self, entry):
@@ -347,12 +384,14 @@ class Scheduler(object):
         task = self.app.tasks.get(entry.task)
 
         try:
+            entry_args = [v() if isinstance(v, BeatLazyFunc) else v for v in (entry.args or [])]
+            entry_kwargs = {k: v() if isinstance(v, BeatLazyFunc) else v for k, v in entry.kwargs.items()}
             if task:
-                return task.apply_async(entry.args, entry.kwargs,
+                return task.apply_async(entry_args, entry_kwargs,
                                         producer=producer,
                                         **entry.options)
             else:
-                return self.send_task(entry.task, entry.args, entry.kwargs,
+                return self.send_task(entry.task, entry_args, entry_kwargs,
                                       producer=producer,
                                       **entry.options)
         except Exception as exc:  # pylint: disable=broad-except

@@ -5,8 +5,8 @@ import sys
 import warnings
 
 import pytest
-from case import Mock, mock, patch
 
+from case import Mock, mock, patch
 from celery import loaders
 from celery.exceptions import NotConfigured
 from celery.five import bytes_if_py2
@@ -93,10 +93,11 @@ class test_LoaderBase:
         def trigger_exception(**kwargs):
             raise ImportError('Dummy ImportError')
         from celery.signals import import_modules
-        import_modules.connect(trigger_exception)
+        x = import_modules.connect(trigger_exception)
         self.app.conf.imports = ('os', 'sys')
         with pytest.raises(ImportError):
             self.loader.import_default_modules()
+        import_modules.disconnect(x)
 
     def test_import_from_cwd_custom_imp(self):
         imp = Mock(name='imp')
