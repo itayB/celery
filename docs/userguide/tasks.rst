@@ -31,7 +31,7 @@ instead. See also the FAQ entry :ref:`faq-acks_late-vs-retry`.
 
 Note that the worker will acknowledge the message if the child process executing
 the task is terminated (either by the task calling :func:`sys.exit`, or by signal)
-even when :attr:`~Task.acks_late` is enabled.  This behavior is by purpose
+even when :attr:`~Task.acks_late` is enabled.  This behavior is intentional
 as...
 
 #. We don't want to rerun tasks that forces the kernel to send
@@ -67,7 +67,7 @@ consider enabling the :setting:`task_reject_on_worker_lost` setting.
     The default prefork pool scheduler is not friendly to long-running tasks,
     so if you have tasks that run for minutes/hours make sure you enable
     the :option:`-Ofair <celery worker -O>` command-line argument to
-    the :program:`celery worker`. See :ref:`prefork-pool-prefetch` for more
+    the :program:`celery worker`. See :ref:`optimizing-prefetch-limit` for more
     information, and for the best performance route long-running and
     short-running tasks to dedicated workers (:ref:`routing-automatic`).
 
@@ -802,6 +802,19 @@ By default, this exponential backoff will also introduce random jitter_ to
 avoid having all the tasks run at the same moment. It will also cap the
 maximum backoff delay to 10 minutes. All these settings can be customized
 via options documented below.
+
+.. versionadded:: 4.4
+
+You can also set `autoretry_for`, `retry_kwargs`, `retry_backoff`, `retry_backoff_max` and `retry_jitter` options in class-based tasks:
+
+.. code-block:: python
+
+    class BaseTaskWithRetry(Task):
+        autoretry_for = (TypeError,)
+        retry_kwargs = {'max_retries': 5}
+        retry_backoff = True
+        retry_backoff_max = 700
+        retry_jitter = False
 
 .. attribute:: Task.autoretry_for
 
@@ -1945,14 +1958,16 @@ Let's have a look at another example:
 .. code-block:: python
 
     from django.db import transaction
+    from django.http import HttpResponseRedirect
 
-    @transaction.commit_on_success
+    @transaction.atomic
     def create_article(request):
         article = Article.objects.create()
         expand_abbreviations.delay(article.pk)
+        return HttpResponseRedirect('/articles/')
 
 This is a Django view creating an article object in the database,
-then passing the primary key to a task. It uses the `commit_on_success`
+then passing the primary key to a task. It uses the `transaction.atomic`
 decorator, that will commit the transaction when the view returns, or
 roll back if the view raises an exception.
 

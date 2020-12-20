@@ -1,16 +1,17 @@
-from __future__ import absolute_import, unicode_literals
+from unittest.mock import Mock, call, patch
 
 import pytest
 
-from case import Mock, call, patch, skip
+from celery import states
 from celery.backends import azureblockblob
 from celery.backends.azureblockblob import AzureBlockBlobBackend
 from celery.exceptions import ImproperlyConfigured
 
 MODULE_TO_MOCK = "celery.backends.azureblockblob"
 
+pytest.importorskip('azure.storage.blob')
 
-@skip.unless_module("azure")
+
 class test_AzureBlockBlobBackend:
     def setup(self):
         self.url = (
@@ -71,7 +72,7 @@ class test_AzureBlockBlobBackend:
 
     @patch(MODULE_TO_MOCK + ".AzureBlockBlobBackend._client")
     def test_set(self, mock_client):
-        self.backend.set(b"mykey", "myvalue")
+        self.backend._set_with_state(b"mykey", "myvalue", states.SUCCESS)
 
         mock_client.create_blob_from_text.assert_called_once_with(
             "celery", "mykey", "myvalue")

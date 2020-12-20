@@ -1,20 +1,19 @@
-from __future__ import absolute_import, unicode_literals
-
 import pickle
 from decimal import Decimal
 from itertools import count
 from random import shuffle
 from time import time
+from unittest.mock import Mock, patch
 
-from case import Mock, patch, skip
+import pytest
+
 from celery import states, uuid
 from celery.events import Event
 from celery.events.state import (HEARTBEAT_DRIFT_MAX, HEARTBEAT_EXPIRE_WINDOW,
                                  State, Task, Worker, heartbeat_expires)
-from celery.five import range
 
 
-class replay(object):
+class replay:
 
     def __init__(self, state):
         self.state = state
@@ -100,7 +99,7 @@ class ev_task_states(replay):
 
 def QTEV(type, uuid, hostname, clock, name=None, timestamp=None):
     """Quick task event."""
-    return Event('task-{0}'.format(type), uuid=uuid, hostname=hostname,
+    return Event(f'task-{type}', uuid=uuid, hostname=hostname,
                  clock=clock, name=name, timestamp=timestamp or time())
 
 
@@ -109,7 +108,7 @@ class ev_logical_clock_ordering(replay):
     def __init__(self, state, offset=0, uids=None):
         self.offset = offset or 0
         self.uids = self.setuids(uids)
-        super(ev_logical_clock_ordering, self).__init__(state)
+        super().__init__(state)
 
     def setuids(self, uids):
         uids = self.tA, self.tB, self.tC = uids or [uuid(), uuid(), uuid()]
@@ -341,7 +340,7 @@ class test_State:
         assert now[1][0] == tC
         assert now[2][0] == tB
 
-    @skip.todo(reason='not working')
+    @pytest.mark.skip('TODO: not working')
     def test_task_descending_clock_ordering(self):
         state = State()
         r = ev_logical_clock_ordering(state)
@@ -676,3 +675,26 @@ class test_State:
         s = State(callback=callback)
         s.event({'type': 'worker-online'})
         assert scratch.get('recv')
+
+    def test_deepcopy(self):
+        import copy
+        s = State()
+        s.event({
+            'type': 'task-success',
+            'root_id': 'x',
+            'uuid': 'x',
+            'hostname': 'y',
+            'clock': 3,
+            'timestamp': time(),
+            'local_received': time(),
+        })
+        s.event({
+            'type': 'task-success',
+            'root_id': 'y',
+            'uuid': 'y',
+            'hostname': 'y',
+            'clock': 4,
+            'timestamp': time(),
+            'local_received': time(),
+        })
+        copy.deepcopy(s)

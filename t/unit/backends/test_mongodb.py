@@ -1,14 +1,19 @@
-from __future__ import absolute_import, unicode_literals
-
 import datetime
 from pickle import dumps, loads
+from unittest.mock import ANY, MagicMock, Mock, patch, sentinel
 
 import pytest
+import pytz
+from case import mock
 from kombu.exceptions import EncodeError
 
-from case import ANY, MagicMock, Mock, mock, patch, sentinel, skip
+try:
+    from pymongo.errors import ConfigurationError
+except ImportError:
+    ConfigurationError = None
+
 from celery import states, uuid
-from celery.backends.mongodb import InvalidDocument, MongoBackend
+from celery.backends.mongodb import Binary, InvalidDocument, MongoBackend
 from celery.exceptions import ImproperlyConfigured
 
 COLLECTION = 'taskmeta_celery'
@@ -21,10 +26,10 @@ MONGODB_DATABASE = 'testing'
 MONGODB_COLLECTION = 'collection1'
 MONGODB_GROUP_COLLECTION = 'group_collection1'
 
+pytest.importorskip('pymongo')
 
-@skip.unless_module('pymongo')
+
 class test_MongoBackend:
-
     default_url = 'mongodb://uuuu:pwpw@hostname.dom/database'
     replica_set_url = (
         'mongodb://uuuu:pwpw@hostname.dom,'
@@ -121,11 +126,10 @@ class test_MongoBackend:
 
         mb = MongoBackend(app=self.app, url='mongodb://')
 
-    @patch('dns.resolver.query')
-    def test_init_mongodb_dns_seedlist(self, dns_resolver_query):
-        from dns.rdtypes.IN.SRV import SRV
-        from dns.rdtypes.ANY.TXT import TXT
-        from dns.name import Name
+    def test_init_mongodb_dns_seedlist(self):
+        Name = pytest.importorskip('dns.name').Name
+        TXT = pytest.importorskip('dns.rdtypes.ANY.TXT').TXT
+        SRV = pytest.importorskip('dns.rdtypes.IN.SRV').SRV
 
         self.app.conf.mongodb_backend_settings = None
 
@@ -143,8 +147,6 @@ class test_MongoBackend:
             elif rdtype == 'TXT':
                 return [TXT(0, 0, [b'replicaSet=rs0'])]
 
-        dns_resolver_query.side_effect = mock_resolver
-
         # uri with user, password, database name, replica set,
         # DNS seedlist format
         uri = ('srv://'
@@ -152,20 +154,21 @@ class test_MongoBackend:
                'dns-seedlist-host.example.com/'
                'celerydatabase')
 
-        mb = MongoBackend(app=self.app, url=uri)
-        assert mb.mongo_host == [
-            'mongo1.example.com:27017',
-            'mongo2.example.com:27017',
-            'mongo3.example.com:27017',
-        ]
-        assert mb.options == dict(
-            mb._prepare_client_options(),
-            replicaset='rs0',
-            ssl=True
-        )
-        assert mb.user == 'celeryuser'
-        assert mb.password == 'celerypassword'
-        assert mb.database_name == 'celerydatabase'
+        with patch('dns.resolver.query', side_effect=mock_resolver):
+            mb = MongoBackend(app=self.app, url=uri)
+            assert mb.mongo_host == [
+                'mongo1.example.com:27017',
+                'mongo2.example.com:27017',
+                'mongo3.example.com:27017',
+            ]
+            assert mb.options == dict(
+                mb._prepare_client_options(),
+                replicaset='rs0',
+                ssl=True
+            )
+            assert mb.user == 'celeryuser'
+            assert mb.password == 'celerypassword'
+            assert mb.database_name == 'celerydatabase'
 
     def test_ensure_mongodb_uri_compliance(self):
         mb = MongoBackend(app=self.app, url=None)
@@ -219,6 +222,42 @@ class test_MongoBackend:
                 host=mongodb_uri, **self.backend._prepare_client_options()
             )
             assert sentinel.connection == connection
+
+    def test_get_connection_with_authmechanism(self):
+        with patch('pymongo.MongoClient') as mock_Connection:
+            self.app.conf.mongodb_backend_settings = None
+            uri = ('mongodb://'
+                   'celeryuser:celerypassword@'
+                   'localhost:27017/'
+                   'celerydatabase?authMechanism=SCRAM-SHA-256')
+            mb = MongoBackend(app=self.app, url=uri)
+            mock_Connection.return_value = sentinel.connection
+            connection = mb._get_connection()
+            mock_Connection.assert_called_once_with(
+                host=['localhost:27017'],
+                username='celeryuser',
+                password='celerypassword',
+                authmechanism='SCRAM-SHA-256',
+                **mb._prepare_client_options()
+            )
+            assert sentinel.connection == connection
+
+    def test_get_connection_with_authmechanism_no_username(self):
+        with patch('pymongo.MongoClient') as mock_Connection:
+            self.app.conf.mongodb_backend_settings = None
+            uri = ('mongodb://'
+                   'localhost:27017/'
+                   'celerydatabase?authMechanism=SCRAM-SHA-256')
+            mb = MongoBackend(app=self.app, url=uri)
+            mock_Connection.side_effect = ConfigurationError(
+                'SCRAM-SHA-256 requires a username.')
+            with pytest.raises(ConfigurationError):
+                mb._get_connection()
+            mock_Connection.assert_called_once_with(
+                host=['localhost:27017'],
+                authmechanism='SCRAM-SHA-256',
+                **mb._prepare_client_options()
+            )
 
     @patch('celery.backends.mongodb.MongoBackend._get_connection')
     def test_get_database_no_existing(self, mock_get_connection):
@@ -445,6 +484,12 @@ class test_MongoBackend:
         mock_get_database.assert_called_once_with()
         mock_collection.delete_many.assert_called()
 
+        self.backend.collections = mock_collection = Mock()
+        self.backend.expires = None
+
+        self.backend.cleanup()
+        mock_collection.delete_many.assert_not_called()
+
     def test_get_database_authfailure(self):
         x = MongoBackend(app=self.app)
         x._get_connection = Mock()
@@ -490,20 +535,139 @@ class test_MongoBackend:
             assert worker.startup_info()
 
 
-@skip.unless_module('pymongo')
+@pytest.fixture(scope="function")
+def mongo_backend_factory(app):
+    """Return a factory that creates MongoBackend instance with given serializer, including BSON."""
+
+    def create_mongo_backend(serializer):
+        # NOTE: `bson` is a only mongodb-specific type and can be set only directly on MongoBackend instance.
+        if serializer == "bson":
+            beckend = MongoBackend(app=app)
+            beckend.serializer = serializer
+        else:
+            app.conf.accept_content = ['json', 'pickle', 'msgpack', 'yaml']
+            app.conf.result_serializer = serializer
+            beckend = MongoBackend(app=app)
+        return beckend
+
+    yield create_mongo_backend
+
+
+@pytest.mark.parametrize("serializer,encoded_into", [
+    ('bson', int),
+    ('json', str),
+    ('pickle', Binary),
+    ('msgpack', Binary),
+    ('yaml', str),
+])
 class test_MongoBackend_no_mock:
 
-    def test_encode_decode(self, app):
-        backend = MongoBackend(app=app)
-        data = {'foo': 1}
-        assert backend.decode(backend.encode(data))
-        backend.serializer = 'bson'
-        assert backend.encode(data) == data
-        assert backend.decode(data) == data
+    def test_encode(self, mongo_backend_factory, serializer, encoded_into):
+        backend = mongo_backend_factory(serializer=serializer)
+        assert isinstance(backend.encode(10), encoded_into)
 
-    def test_de(self, app):
-        backend = MongoBackend(app=app)
-        data = {'foo': 1}
-        assert backend.encode(data)
-        backend.serializer = 'bson'
-        assert backend.encode(data) == data
+    def test_encode_decode(self, mongo_backend_factory, serializer,
+                           encoded_into):
+        backend = mongo_backend_factory(serializer=serializer)
+        decoded = backend.decode(backend.encode(12))
+        assert decoded == 12
+
+
+class _MyTestClass:
+
+    def __init__(self, a):
+        self.a = a
+
+    def __eq__(self, other):
+        assert self.__class__ == type(other)
+        return self.a == other.a
+
+
+SUCCESS_RESULT_TEST_DATA = [
+    # json types
+    {
+        "result": "A simple string",
+        "serializers": ["bson", "pickle", "yaml", "json", "msgpack"],
+    },
+    {
+        "result": 100,
+        "serializers": ["bson", "pickle", "yaml", "json", "msgpack"],
+    },
+    {
+        "result": 9.1999999999999999,
+        "serializers": ["bson", "pickle", "yaml", "json", "msgpack"],
+    },
+    {
+        "result": {"foo": "simple result"},
+        "serializers": ["bson", "pickle", "yaml", "json", "msgpack"],
+    },
+    {
+        "result": ["a", "b"],
+        "serializers": ["bson", "pickle", "yaml", "json", "msgpack"],
+    },
+    {
+        "result": False,
+        "serializers": ["bson", "pickle", "yaml", "json", "msgpack"],
+    },
+    {
+        "result": None,
+        "serializers": ["bson", "pickle", "yaml", "json", "msgpack"],
+    },
+    # advanced essential types
+    {
+        "result": datetime.datetime(2000, 1, 1, 0, 0, 0, 0),
+        "serializers": ["bson", "pickle", "yaml"],
+    },
+    {
+        "result": datetime.datetime(2000, 1, 1, 0, 0, 0, 0, tzinfo=pytz.utc),
+        "serializers": ["pickle", "yaml"],
+    },
+    # custom types
+    {
+        "result": _MyTestClass("Hi!"),
+        "serializers": ["pickle"],
+    },
+]
+
+
+class test_MongoBackend_store_get_result:
+
+    @pytest.fixture(scope="function", autouse=True)
+    def fake_mongo_collection_patch(self, monkeypatch):
+        """A fake collection with serialization experience close to MongoDB."""
+        bson = pytest.importorskip("bson")
+
+        class FakeMongoCollection:
+            def __init__(self):
+                self.data = {}
+
+            def replace_one(self, task_id, meta, upsert=True):
+                self.data[task_id['_id']] = bson.encode(meta)
+
+            def find_one(self, task_id):
+                return bson.decode(self.data[task_id['_id']])
+
+        monkeypatch.setattr(MongoBackend, "collection", FakeMongoCollection())
+
+    @pytest.mark.parametrize("serializer,result_type,result", [
+        (s, type(i['result']), i['result']) for i in SUCCESS_RESULT_TEST_DATA
+        for s in i['serializers']]
+    )
+    def test_encode_success_results(self, mongo_backend_factory, serializer,
+                                    result_type, result):
+        backend = mongo_backend_factory(serializer=serializer)
+        backend.store_result(TASK_ID, result, 'SUCCESS')
+        recovered = backend.get_result(TASK_ID)
+        assert type(recovered) == result_type
+        assert recovered == result
+
+    @pytest.mark.parametrize("serializer",
+                             ["bson", "pickle", "yaml", "json", "msgpack"])
+    def test_encode_exception_error_results(self, mongo_backend_factory,
+                                            serializer):
+        backend = mongo_backend_factory(serializer=serializer)
+        exception = Exception("Basic Exception")
+        backend.store_result(TASK_ID, exception, 'FAILURE')
+        recovered = backend.get_result(TASK_ID)
+        assert type(recovered) == type(exception)
+        assert recovered.args == exception.args

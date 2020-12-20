@@ -1,6 +1,4 @@
-# -*- coding: utf-8 -*-
 """Pool implementation abstract factory, and alias definitions."""
-from __future__ import absolute_import, unicode_literals
 
 # Import from kombu directly as it's used
 # early in the import stage, where celery.utils loads
@@ -16,6 +14,13 @@ ALIASES = {
     'solo': 'celery.concurrency.solo:TaskPool',
     'processes': 'celery.concurrency.prefork:TaskPool',  # XXX compat alias
 }
+
+try:
+    import concurrent.futures  # noqa: F401
+except ImportError:
+    pass
+else:
+    ALIASES['threads'] = 'celery.concurrency.thread:TaskPool'
 
 
 def get_implementation(cls):

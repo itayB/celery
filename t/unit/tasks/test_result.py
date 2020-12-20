@@ -1,20 +1,16 @@
-from __future__ import absolute_import, unicode_literals
-
 import copy
 import datetime
 import traceback
 from contextlib import contextmanager
+from unittest.mock import Mock, call, patch
 
 import pytest
 
-from case import Mock, call, patch, skip
 from celery import states, uuid
 from celery.app.task import Context
 from celery.backends.base import SyncBackendMixin
-from celery.exceptions import (CPendingDeprecationWarning,
-                               ImproperlyConfigured, IncompleteStream,
+from celery.exceptions import (ImproperlyConfigured, IncompleteStream,
                                TimeoutError)
-from celery.five import range
 from celery.result import (AsyncResult, EagerResult, GroupResult, ResultSet,
                            assert_will_not_block, result_from_tuple)
 from celery.utils.serialization import pickle
@@ -77,8 +73,9 @@ class test_AsyncResult:
         self.task5 = mock_task(
             'task3', states.FAILURE, KeyError('blue'), PYTRACEBACK,
         )
+        self.task6 = mock_task('task6', states.SUCCESS, None)
         for task in (self.task1, self.task2,
-                     self.task3, self.task4, self.task5):
+                     self.task3, self.task4, self.task5, self.task6):
             save_result(self.app, task)
 
         @self.app.task(shared=False)
@@ -254,31 +251,27 @@ class test_AsyncResult:
 
         with pytest.raises(KeyError):
             notb.get()
-        try:
+        with pytest.raises(KeyError) as excinfo:
             withtb.get()
-        except KeyError:
-            tb = traceback.format_exc()
-            assert '  File "foo.py", line 2, in foofunc' not in tb
-            assert '  File "bar.py", line 3, in barfunc' not in tb
-            assert 'KeyError:' in tb
-            assert "'blue'" in tb
-        else:
-            raise AssertionError('Did not raise KeyError.')
 
-    @skip.unless_module('tblib')
+        tb = [t.strip() for t in traceback.format_tb(excinfo.tb)]
+        assert 'File "foo.py", line 2, in foofunc' not in tb
+        assert 'File "bar.py", line 3, in barfunc' not in tb
+        assert excinfo.value.args[0] == 'blue'
+        assert excinfo.typename == 'KeyError'
+
     def test_raising_remote_tracebacks(self):
+        pytest.importorskip('tblib')
+
         withtb = self.app.AsyncResult(self.task5['id'])
         self.app.conf.task_remote_tracebacks = True
-        try:
+        with pytest.raises(KeyError) as excinfo:
             withtb.get()
-        except KeyError:
-            tb = traceback.format_exc()
-            assert '  File "foo.py", line 2, in foofunc' in tb
-            assert '  File "bar.py", line 3, in barfunc' in tb
-            assert 'KeyError:' in tb
-            assert "'blue'" in tb
-        else:
-            raise AssertionError('Did not raise KeyError.')
+        tb = [t.strip() for t in traceback.format_tb(excinfo.tb)]
+        assert 'File "foo.py", line 2, in foofunc' in tb
+        assert 'File "bar.py", line 3, in barfunc' in tb
+        assert excinfo.value.args[0] == 'blue'
+        assert excinfo.typename == 'KeyError'
 
     def test_str(self):
         ok_res = self.app.AsyncResult(self.task1['id'])
@@ -296,13 +289,13 @@ class test_AsyncResult:
         ok_res = self.app.AsyncResult(self.task1['id'])
         ok2_res = self.app.AsyncResult(self.task2['id'])
         nok_res = self.app.AsyncResult(self.task3['id'])
-        assert repr(ok_res) == '<AsyncResult: %s>' % (self.task1['id'],)
-        assert repr(ok2_res) == '<AsyncResult: %s>' % (self.task2['id'],)
-        assert repr(nok_res) == '<AsyncResult: %s>' % (self.task3['id'],)
+        assert repr(ok_res) == f"<AsyncResult: {self.task1['id']}>"
+        assert repr(ok2_res) == f"<AsyncResult: {self.task2['id']}>"
+        assert repr(nok_res) == f"<AsyncResult: {self.task3['id']}>"
 
         pending_id = uuid()
         pending_res = self.app.AsyncResult(pending_id)
-        assert repr(pending_res) == '<AsyncResult: %s>' % (pending_id,)
+        assert repr(pending_res) == f'<AsyncResult: {pending_id}>'
 
     def test_hash(self):
         assert (hash(self.app.AsyncResult('x0w991')) ==
@@ -332,6 +325,7 @@ class test_AsyncResult:
         ok2_res = self.app.AsyncResult(self.task2['id'])
         nok_res = self.app.AsyncResult(self.task3['id'])
         nok2_res = self.app.AsyncResult(self.task4['id'])
+        none_res = self.app.AsyncResult(self.task6['id'])
 
         callback = Mock(name='callback')
 
@@ -343,6 +337,8 @@ class test_AsyncResult:
         assert nok_res.get(propagate=False)
         assert isinstance(nok2_res.result, KeyError)
         assert ok_res.info == 'the'
+        assert none_res.get() is None
+        assert none_res.state == states.SUCCESS
 
     def test_get_when_ignored(self):
         result = self.app.AsyncResult(uuid())
@@ -469,6 +465,49 @@ class test_ResultSet:
         x.get()
         x.join_native.assert_called()
 
+    @patch('celery.result.task_join_will_block')
+    def test_get_sync_subtask_option(self, task_join_will_block):
+        task_join_will_block.return_value = True
+        x = self.app.ResultSet([self.app.AsyncResult(str(t)) for t in [1, 2, 3]])
+        b = x.results[0].backend = Mock()
+        b.supports_native_join = False
+        with pytest.raises(RuntimeError):
+            x.get()
+        with pytest.raises(TimeoutError):
+            x.get(disable_sync_subtasks=False, timeout=0.1)
+
+    def test_join_native_with_group_chain_group(self):
+        """Test group(chain(group)) case, join_native can be run correctly.
+        In group(chain(group)) case, GroupResult has no _cache property, and
+        AsyncBackendMixin.iter_native returns a node instead of node._cache,
+        this test make sure ResultSet.join_native can process correctly both
+        values of AsyncBackendMixin.iter_native returns.
+        """
+        def _get_meta(tid, result=None, children=None):
+            return {
+                'status': states.SUCCESS,
+                'result': result,
+                'children': children,
+                'task_id': tid,
+            }
+
+        results = [self.app.AsyncResult(t) for t in [1, 2, 3]]
+        values = [(_.id, _get_meta(_.id, _)) for _ in results]
+        g_res = GroupResult(6, [self.app.AsyncResult(t) for t in [4, 5]])
+        results += [g_res]
+        values += [(6, g_res.children)]
+        x = self.app.ResultSet(results)
+        x.results[0].backend = Mock()
+        x.results[0].backend.join = Mock()
+        x.results[3][0].get = Mock()
+        x.results[3][0].get.return_value = g_res.results[0]
+        x.results[3][1].get = Mock()
+        x.results[3][1].get.return_value = g_res.results[1]
+        x.iter_native = Mock()
+        x.iter_native.return_value = values.__iter__()
+        x.join_native()
+        x.iter_native.assert_called()
+
     def test_eq_ne(self):
         g1 = self.app.ResultSet([
             self.app.AsyncResult('id1'),
@@ -516,48 +555,6 @@ class test_ResultSet:
 
             yield
 
-    def test_iterate_respects_subpolling_interval(self):
-        r1 = self.app.AsyncResult(uuid())
-        r2 = self.app.AsyncResult(uuid())
-        backend = r1.backend = r2.backend = Mock()
-        backend.subpolling_interval = 10
-
-        ready = r1.ready = r2.ready = Mock()
-
-        def se(*args, **kwargs):
-            ready.side_effect = KeyError()
-            return False
-        ready.return_value = False
-        ready.side_effect = se
-
-        x = self.app.ResultSet([r1, r2])
-        with self.dummy_copy():
-            with patch('celery.result.time') as _time:
-                with pytest.warns(CPendingDeprecationWarning):
-                    with pytest.raises(KeyError):
-                        list(x.iterate())
-                _time.sleep.assert_called_with(10)
-
-            backend.subpolling_interval = 0
-            with patch('celery.result.time') as _time:
-                with pytest.warns(CPendingDeprecationWarning):
-                    with pytest.raises(KeyError):
-                        ready.return_value = False
-                        ready.side_effect = se
-                        list(x.iterate())
-                    _time.sleep.assert_not_called()
-
-    def test_times_out(self):
-        r1 = self.app.AsyncResult(uuid)
-        r1.ready = Mock()
-        r1.ready.return_value = False
-        x = self.app.ResultSet([r1])
-        with self.dummy_copy():
-            with patch('celery.result.time'):
-                with pytest.warns(CPendingDeprecationWarning):
-                    with pytest.raises(TimeoutError):
-                        list(x.iterate(timeout=1))
-
     def test_add_discard(self):
         x = self.app.ResultSet([])
         x.add(self.app.AsyncResult('1'))
@@ -597,7 +594,7 @@ class MockAsyncResultSuccess(AsyncResult):
 
     def __init__(self, *args, **kwargs):
         self._result = kwargs.pop('result', 42)
-        super(MockAsyncResultSuccess, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
 
     def forget(self):
         self.forgotten = True
@@ -686,14 +683,6 @@ class test_GroupResult:
     def test_pickleable(self):
         assert pickle.loads(pickle.dumps(self.ts))
 
-    def test_iterate_raises(self):
-        ar = MockAsyncResultFailure(uuid(), app=self.app)
-        ts = self.app.GroupResult(uuid(), [ar])
-        with pytest.warns(CPendingDeprecationWarning):
-            it = ts.iterate()
-        with pytest.raises(KeyError):
-            next(it)
-
     def test_forget(self):
         subs = [MockAsyncResultSuccess(uuid(), app=self.app),
                 MockAsyncResultSuccess(uuid(), app=self.app)]
@@ -719,19 +708,19 @@ class test_GroupResult:
                 ]),
             ]),
         ])
-        ts.app.backend = backend
 
-        vals = ts.get()
-        assert vals == [
-            '1.1',
-            [
-                '2.1',
+        with patch('celery.Celery.backend', new=backend):
+            vals = ts.get()
+            assert vals == [
+                '1.1',
                 [
-                    '3.1',
-                    '3.2',
-                ]
-            ],
-        ]
+                    '2.1',
+                    [
+                        '3.1',
+                        '3.2',
+                    ]
+                ],
+            ]
 
     def test_getitem(self):
         subs = [MockAsyncResultSuccess(uuid(), app=self.app),
@@ -782,15 +771,16 @@ class test_GroupResult:
         results = [self.app.AsyncResult(uuid(), backend=backend)
                    for i in range(10)]
         ts = self.app.GroupResult(uuid(), results)
-        ts.app.backend = backend
-        backend.ids = [result.id for result in results]
-        res = ts.join_native()
-        assert res == list(range(10))
-        callback = Mock(name='callback')
-        assert not ts.join_native(callback=callback)
-        callback.assert_has_calls([
-            call(r.id, i) for i, r in enumerate(ts.results)
-        ])
+
+        with patch('celery.Celery.backend', new=backend):
+            backend.ids = [result.id for result in results]
+            res = ts.join_native()
+            assert res == list(range(10))
+            callback = Mock(name='callback')
+            assert not ts.join_native(callback=callback)
+            callback.assert_has_calls([
+                call(r.id, i) for i, r in enumerate(ts.results)
+            ])
 
     def test_join_native_raises(self):
         ts = self.app.GroupResult(uuid(), [self.app.AsyncResult(uuid())])
@@ -824,27 +814,9 @@ class test_GroupResult:
         results = [self.app.AsyncResult(uuid(), backend=backend)
                    for i in range(10)]
         ts = self.app.GroupResult(uuid(), results)
-        ts.app.backend = backend
-        backend.ids = [result.id for result in results]
-        assert len(list(ts.iter_native())) == 10
-
-    def test_iterate_yields(self):
-        ar = MockAsyncResultSuccess(uuid(), app=self.app)
-        ar2 = MockAsyncResultSuccess(uuid(), app=self.app)
-        ts = self.app.GroupResult(uuid(), [ar, ar2])
-        with pytest.warns(CPendingDeprecationWarning):
-            it = ts.iterate()
-        assert next(it) == 42
-        assert next(it) == 42
-
-    def test_iterate_eager(self):
-        ar1 = EagerResult(uuid(), 42, states.SUCCESS)
-        ar2 = EagerResult(uuid(), 42, states.SUCCESS)
-        ts = self.app.GroupResult(uuid(), [ar1, ar2])
-        with pytest.warns(CPendingDeprecationWarning):
-            it = ts.iterate()
-        assert next(it) == 42
-        assert next(it) == 42
+        with patch('celery.Celery.backend', new=backend):
+            backend.ids = [result.id for result in results]
+            assert len(list(ts.iter_native())) == 10
 
     def test_join_timeout(self):
         ar = MockAsyncResultSuccess(uuid(), app=self.app)
@@ -865,12 +837,6 @@ class test_GroupResult:
     def test_iter_native_when_empty_group(self):
         ts = self.app.GroupResult(uuid(), [])
         assert list(ts.iter_native()) == []
-
-    def test_iterate_simple(self):
-        with pytest.warns(CPendingDeprecationWarning):
-            it = self.ts.iterate()
-        results = sorted(list(it))
-        assert results == list(range(self.size))
 
     def test___iter__(self):
         assert list(iter(self.ts)) == self.ts.results
@@ -926,16 +892,6 @@ class test_failed_AsyncResult:
 
     def test_completed_count(self):
         assert self.ts.completed_count() == len(self.ts) - 1
-
-    def test_iterate_simple(self):
-        with pytest.warns(CPendingDeprecationWarning):
-            it = self.ts.iterate()
-
-        def consume():
-            return list(it)
-
-        with pytest.raises(KeyError):
-            consume()
 
     def test_join(self):
         with pytest.raises(KeyError):
@@ -1031,6 +987,12 @@ class test_tuples:
         x = result_from_tuple([uid, []], app=self.app)
         assert x.id == uid
 
+    def test_as_list(self):
+        uid = uuid()
+        x = self.app.AsyncResult(uid)
+        assert x.id == x.as_list()[0]
+        assert isinstance(x.as_list(), list)
+
     def test_GroupResult(self):
         x = self.app.GroupResult(
             uuid(), [self.app.AsyncResult(uuid()) for _ in range(10)],
@@ -1052,7 +1014,7 @@ class test_tuples:
         parent = self.app.AsyncResult(uuid())
         result = self.app.GroupResult(
             'group-result-1',
-            [self.app.AsyncResult('async-result-{}'.format(i))
+            [self.app.AsyncResult(f'async-result-{i}')
              for i in range(2)],
             parent
         )
@@ -1061,6 +1023,6 @@ class test_tuples:
         assert parent_tuple == parent.as_tuple()
         assert parent_tuple[0][0] == parent.id
         assert isinstance(group_results, list)
-        expected_grp_res = [(('async-result-{}'.format(i), None), None)
+        expected_grp_res = [((f'async-result-{i}', None), None)
                             for i in range(2)]
         assert group_results == expected_grp_res

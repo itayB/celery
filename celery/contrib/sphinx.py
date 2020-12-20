@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Sphinx documentation plugin used to document tasks.
 
 Introduction
@@ -6,6 +5,8 @@ Introduction
 
 Usage
 -----
+
+The Celery extension for Sphinx requires Sphinx 2.0 or later.
 
 Add the extension to your :file:`docs/conf.py` configuration module:
 
@@ -29,16 +30,12 @@ syntax.
 
 Use ``.. autotask::`` to alternatively manually document a task.
 """
-from __future__ import absolute_import, unicode_literals
+from inspect import formatargspec, getfullargspec
 
-from celery.app.task import BaseTask
-from sphinx.domains.python import PyModulelevel
+from sphinx.domains.python import PyFunction
 from sphinx.ext.autodoc import FunctionDocumenter
 
-try:  # pragma: no cover
-    from inspect import formatargspec, getfullargspec
-except ImportError:  # Py2
-    from inspect import formatargspec, getargspec as getfullargspec  # noqa
+from celery.app.task import BaseTask
 
 
 class TaskDocumenter(FunctionDocumenter):
@@ -73,10 +70,10 @@ class TaskDocumenter(FunctionDocumenter):
         wrapped = getattr(self.object, '__wrapped__', None)
         if wrapped and getattr(wrapped, '__module__') == self.modname:
             return True
-        return super(TaskDocumenter, self).check_module()
+        return super().check_module()
 
 
-class TaskDirective(PyModulelevel):
+class TaskDirective(PyFunction):
     """Sphinx task directive."""
 
     def get_signature_prefix(self, sig):

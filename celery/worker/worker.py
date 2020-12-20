@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """WorkController can be used to instantiate in-process workers.
 
 The command-line interface for the worker is in :mod:`celery.bin.worker`,
@@ -12,10 +11,10 @@ global side-effects (i.e., except for the global state stored in
 The worker consists of several components, all managed by bootsteps
 (mod:`celery.bootsteps`).
 """
-from __future__ import absolute_import, unicode_literals
 
 import os
 import sys
+from datetime import datetime
 
 from billiard import cpu_count
 from kombu.utils.compat import detect_environment
@@ -26,7 +25,6 @@ from celery import signals
 from celery.bootsteps import RUN, TERMINATE
 from celery.exceptions import (ImproperlyConfigured, TaskRevokedError,
                                WorkerTerminate)
-from celery.five import python_2_unicode_compatible, values
 from celery.platforms import EX_FAILURE, create_pidlock
 from celery.utils.imports import reload_from_cwd
 from celery.utils.log import mlevel
@@ -62,8 +60,7 @@ defined in the `task_queues` setting.
 """
 
 
-@python_2_unicode_compatible
-class WorkController(object):
+class WorkController:
     """Unmanaged worker instance."""
 
     app = None
@@ -93,6 +90,7 @@ class WorkController(object):
     def __init__(self, app=None, hostname=None, **kwargs):
         self.app = app or self.app
         self.hostname = default_nodename(hostname)
+        self.startup_time = datetime.utcnow()
         self.app.loader.init_worker()
         self.on_before_init(**kwargs)
         self.setup_defaults(**kwargs)
@@ -191,7 +189,7 @@ class WorkController(object):
             [self.app.loader.import_task_module(m) for m in includes]
         self.include = includes
         task_modules = {task.__class__.__module__
-                        for task in values(self.app.tasks)}
+                        for task in self.app.tasks.values()}
         self.app.conf.include = tuple(set(prev) | task_modules)
 
     def prepare_args(self, **kwargs):
@@ -296,9 +294,11 @@ class WorkController(object):
             return reload_from_cwd(sys.modules[module], reloader)
 
     def info(self):
+        uptime = datetime.utcnow() - self.startup_time
         return {'total': self.state.total_count,
                 'pid': os.getpid(),
-                'clock': str(self.app.clock)}
+                'clock': str(self.app.clock),
+                'uptime': round(uptime.total_seconds())}
 
     def rusage(self):
         if resource is None:

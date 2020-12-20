@@ -135,23 +135,18 @@ task that adds 16 to the previous result, forming the expression
 
 
 You can also cause a callback to be applied if task raises an exception
-(*errback*), but this behaves differently from a regular callback
-in that it will be passed the id of the parent task, not the result.
-This is because it may not always be possible to serialize
-the exception raised, and so this way the error callback requires
-a result backend to be enabled, and the task must retrieve the result
-of the task instead.
+(*errback*). The worker won't actually call the errback as a task, but will
+instead call the errback function directly so that the raw request, exception
+and traceback objects can be passed to it.
 
 This is an example error callback:
 
 .. code-block:: python
 
     @app.task
-    def error_handler(uuid):
-        result = AsyncResult(uuid)
-        exc = result.get(propagate=False)
+    def error_handler(request, exc, traceback):
         print('Task {0} raised exception: {1!r}\n{2!r}'.format(
-              uuid, exc, result.traceback))
+              request.id, exc, traceback))
 
 it can be added to the task using the ``link_error`` execution
 option:
@@ -447,6 +442,16 @@ json -- JSON is supported in many programming languages, is now
 
     See http://json.org for more information.
 
+    .. note::
+
+        (From Python official docs https://docs.python.org/3.6/library/json.html)
+        Keys in key/value pairs of JSON are always of the type :class:`str`. When
+        a dictionary is converted into JSON, all the keys of the dictionary are
+        coerced to strings. As a result of this, if a dictionary is converted
+        into JSON and then back into a dictionary, the dictionary may not equal
+        the original one. That is, ``loads(dumps(x)) != x`` if x has non-string
+        keys.
+
 pickle -- If you have no desire to support any language other than
     Python, then using the pickle encoding will gain you the support of
     all built-in Python data types (except class instances), smaller
@@ -682,7 +687,7 @@ the workers :option:`-Q <celery worker -Q>` argument:
 
 .. code-block:: console
 
-    $ celery -A proj worker -l info -Q celery,priority.high
+    $ celery -A proj worker -l INFO -Q celery,priority.high
 
 .. seealso::
 
@@ -701,13 +706,13 @@ setting or by using the ``ignore_result`` option:
 
 .. code-block:: pycon
 
-  >>> result = add.apply_async(1, 2, ignore_result=True)
+  >>> result = add.apply_async((1, 2), ignore_result=True)
   >>> result.get()
   None
 
   >>> # Do not ignore result (default)
   ...
-  >>> result = add.apply_async(1, 2, ignore_result=False)
+  >>> result = add.apply_async((1, 2), ignore_result=False)
   >>> result.get()
   3
 

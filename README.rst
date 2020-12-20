@@ -2,7 +2,7 @@
 
 |build-status| |coverage| |license| |wheel| |pyversion| |pyimp| |ocbackerbadge| |ocsponsorbadge|
 
-:Version: 4.4.0rc3 (cliffs)
+:Version: 5.0.5 (singularity)
 :Web: http://celeryproject.org/
 :Download: https://pypi.org/project/celery/
 :Source: https://github.com/celery/celery/
@@ -19,12 +19,12 @@ If you are using Celery to create a commercial product, please consider becoming
 .. _`backer`: https://opencollective.com/celery#backer
 .. _`sponsor`: https://opencollective.com/celery#sponsor
 
+For enterprise
+==============
 
-Sponsors
---------
+Available as part of the Tidelift Subscription.
 
-`Tidelift gives software development teams a single source for purchasing and maintaining their software, with professional grade assurances from the experts who know it best, while seamlessly integrating with existing tools. <https://tidelift.com/subscription/pkg/pypi-celery?utm_source=pypi-celery&utm_medium=referral&utm_campaign=readme>`_
-
+The maintainers of ``celery`` and thousands of other packages are working with Tidelift to deliver commercial support and maintenance for the open source dependencies you use to build your applications. Save time, reduce risk, and improve code health, while paying the maintainers of the exact dependencies you use. `Learn more. <https://tidelift.com/subscription/pkg/pypi-celery?utm_source=pypi-celery&utm_medium=referral&utm_campaign=enterprise&utm_term=repo>`_
 
 What's a Task Queue?
 ====================
@@ -44,33 +44,34 @@ to high availability and horizontal scaling.
 
 Celery is written in Python, but the protocol can be implemented in any
 language. In addition to Python there's node-celery_ for Node.js,
-and a `PHP client`_.
+a `PHP client`_, `gocelery`_ for golang, and rusty-celery_ for Rust.
 
 Language interoperability can also be achieved by using webhooks
 in such a way that the client enqueues an URL to be requested by a worker.
 
 .. _node-celery: https://github.com/mher/node-celery
 .. _`PHP client`: https://github.com/gjedeer/celery-php
+.. _`gocelery`: https://github.com/gocelery/gocelery
+.. _rusty-celery: https://github.com/rusty-celery/rusty-celery
 
 What do I need?
 ===============
 
-Celery version 4.3 runs on,
+Celery version 5.0.5 runs on,
 
-- Python (2.7, 3.4, 3.5, 3.6, 3.7)
-- PyPy2.7 (6.0)
-- PyPy3.5 (6.0)
+- Python (3.6, 3.7, 3.8)
+- PyPy3.6 (7.6)
 
 
-This is the last version to support Python 2.7,
-and from the next version (Celery 5.x) Python 3.5 or newer is required.
+This is the next version of celery which will support Python 3.6 or newer.
 
 If you're running an older version of Python, you need to be running
 an older version of Celery:
 
 - Python 2.6: Celery series 3.1 or earlier.
 - Python 2.5: Celery series 3.0 or earlier.
-- Python 2.4 was Celery series 2.2 or earlier.
+- Python 2.4: Celery series 2.2 or earlier.
+- Python 2.7: Celery 4.x series.
 
 Celery is a project with minimal funding,
 so we don't support Microsoft Windows.
@@ -88,7 +89,7 @@ Get Started
 ===========
 
 If this is the first time you're trying to use Celery, or you're
-new to Celery 4.2 coming from previous versions then you should read our
+new to Celery 5.0.5 coming from previous versions then you should read our
 getting started tutorials:
 
 - `First steps with Celery`_
@@ -217,6 +218,8 @@ Documentation
 
 The `latest documentation`_ is hosted at Read The Docs, containing user guides,
 tutorials, and an API reference.
+
+最新的中文文档托管在 https://www.celerycn.io/ 中，包含用户指南、教程、API接口等。
 
 .. _`latest documentation`: http://docs.celeryproject.org/en/latest/
 
@@ -495,9 +498,9 @@ file in the top distribution directory for the full license text.
 
 .. # vim: syntax=rst expandtab tabstop=4 shiftwidth=4 shiftround
 
-.. |build-status| image:: https://secure.travis-ci.org/celery/celery.png?branch=master
+.. |build-status| image:: https://api.travis-ci.com/celery/celery.png?branch=master
     :alt: Build status
-    :target: https://travis-ci.org/celery/celery
+    :target: https://travis-ci.com/celery/celery
 
 .. |coverage| image:: https://codecov.io/github/celery/celery/coverage.svg?branch=master
     :target: https://codecov.io/github/celery/celery?branch=master
@@ -515,7 +518,7 @@ file in the top distribution directory for the full license text.
     :target: https://pypi.org/project/celery/
 
 .. |pyimp| image:: https://img.shields.io/pypi/implementation/celery.svg
-    :alt: Support Python implementations.
+    :alt: Supported Python implementations.
     :target: https://pypi.org/project/celery/
 
 .. |ocbackerbadge| image:: https://opencollective.com/celery/backers/badge.svg

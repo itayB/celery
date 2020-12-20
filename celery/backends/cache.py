@@ -1,12 +1,8 @@
-# -*- coding: utf-8 -*-
 """Memcached and in-memory cache result backend."""
-from __future__ import absolute_import, unicode_literals
-
 from kombu.utils.encoding import bytes_to_str, ensure_bytes
 from kombu.utils.objects import cached_property
 
 from celery.exceptions import ImproperlyConfigured
-from celery.five import PY3
 from celery.utils.functional import LRUCache
 
 from .base import KeyValueStoreBackend
@@ -24,10 +20,14 @@ The cache backend {0!r} is unknown,
 Please use one of the following backends instead: {1}\
 """
 
+# Global shared in-memory cache for in-memory cache client
+# This is to share cache between threads
+_DUMMY_CLIENT_CACHE = LRUCache(limit=5000)
+
 
 def import_best_memcache():
     if _imp[0] is None:
-        is_pylibmc, memcache_key_t = False, ensure_bytes
+        is_pylibmc, memcache_key_t = False, bytes_to_str
         try:
             import pylibmc as memcache
             is_pylibmc = True
@@ -36,8 +36,6 @@ def import_best_memcache():
                 import memcache  # noqa
             except ImportError:
                 raise ImproperlyConfigured(REQUIRES_BACKEND)
-        if PY3:  # pragma: no cover
-            memcache_key_t = bytes_to_str
         _imp[0] = (is_pylibmc, memcache, memcache_key_t)
     return _imp[0]
 
@@ -56,10 +54,10 @@ def get_best_memcache(*args, **kwargs):
     return Client, key_t
 
 
-class DummyClient(object):
+class DummyClient:
 
     def __init__(self, *args, **kwargs):
-        self.cache = LRUCache(limit=5000)
+        self.cache = _DUMMY_CLIENT_CACHE
 
     def get(self, key, *args, **kwargs):
         return self.cache.get(key)
@@ -100,7 +98,7 @@ class CacheBackend(KeyValueStoreBackend):
     def __init__(self, app, expires=None, backend=None,
                  options=None, url=None, **kwargs):
         options = {} if not options else options
-        super(CacheBackend, self).__init__(app, **kwargs)
+        super().__init__(app, **kwargs)
         self.url = url
 
         self.options = dict(self.app.conf.cache_backend_options,
@@ -133,7 +131,7 @@ class CacheBackend(KeyValueStoreBackend):
     def _apply_chord_incr(self, header_result, body, **kwargs):
         chord_key = self.get_key_for_chord(header_result.id)
         self.client.set(chord_key, 0, time=self.expires)
-        return super(CacheBackend, self)._apply_chord_incr(
+        return super()._apply_chord_incr(
             header_result, body, **kwargs)
 
     def incr(self, key):
@@ -149,12 +147,12 @@ class CacheBackend(KeyValueStoreBackend):
     def __reduce__(self, args=(), kwargs=None):
         kwargs = {} if not kwargs else kwargs
         servers = ';'.join(self.servers)
-        backend = '{0}://{1}/'.format(self.backend, servers)
+        backend = f'{self.backend}://{servers}/'
         kwargs.update(
             {'backend': backend,
              'expires': self.expires,
              'options': self.options})
-        return super(CacheBackend, self).__reduce__(args, kwargs)
+        return super().__reduce__(args, kwargs)
 
     def as_uri(self, *args, **kwargs):
         """Return the backend as an URI.
@@ -162,4 +160,4 @@ class CacheBackend(KeyValueStoreBackend):
         This properly handles the case of multiple servers.
         """
         servers = ';'.join(self.servers)
-        return '{0}://{1}/'.format(self.backend, servers)
+        return f'{self.backend}://{servers}/'

@@ -1,12 +1,10 @@
-from __future__ import absolute_import, unicode_literals
-
 from datetime import datetime, timedelta, tzinfo
+from unittest.mock import Mock, patch
 
 import pytest
 import pytz
 from pytz import AmbiguousTimeError
 
-from case import Mock, patch
 from celery.utils.iso8601 import parse_iso8601
 from celery.utils.time import (LocalTimezone, delta_resolution, ffwd,
                                get_exponential_backoff_interval,
@@ -138,8 +136,9 @@ def test_remaining():
 
     """
     Case 3: DST check
-    Suppose start (which is last_run_time) is in EST while next_run is in EDT, then
-    check whether the `next_run` is actually the time specified in the start (i.e. there is not an hour diff due to DST).
+    Suppose start (which is last_run_time) is in EST while next_run is in EDT,
+    then check whether the `next_run` is actually the time specified in the
+    start (i.e. there is not an hour diff due to DST).
     In 2019, DST starts on March 10
     """
     start = eastern_tz.localize(datetime(month=3, day=9, year=2019, hour=10, minute=0))         # EST
@@ -355,3 +354,10 @@ class test_get_exponential_backoff_interval:
             retries=3,
             maximum=100
         ) == 0
+
+    @patch('random.randrange')
+    def test_valid_random_range(self, rr):
+        rr.return_value = 0
+        maximum = 100
+        get_exponential_backoff_interval(factor=40, retries=10, maximum=maximum, full_jitter=True)
+        rr.assert_called_once_with(maximum + 1)

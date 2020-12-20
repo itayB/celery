@@ -1,14 +1,14 @@
-# -*- coding: utf-8 -*-
 """Actual App instance implementation."""
-from __future__ import absolute_import, unicode_literals
-
+import inspect
 import os
+import sys
 import threading
 import warnings
-from collections import defaultdict, deque
+from collections import UserDict, defaultdict, deque
 from datetime import datetime
 from operator import attrgetter
 
+from click.exceptions import Exit
 from kombu import pools
 from kombu.clocks import LamportClock
 from kombu.common import oid_from
@@ -16,7 +16,6 @@ from kombu.utils.compat import register_after_fork
 from kombu.utils.objects import cached_property
 from kombu.utils.uuid import uuid
 from vine import starpromise
-from vine.utils import wraps
 
 from celery import platforms, signals
 from celery._state import (_announce_app_finalized, _deregister_app,
@@ -24,8 +23,6 @@ from celery._state import (_announce_app_finalized, _deregister_app,
                            connect_on_app_finalize, get_current_app,
                            get_current_worker_task, set_default_app)
 from celery.exceptions import AlwaysEagerIgnored, ImproperlyConfigured
-from celery.five import (UserDict, bytes_if_py2, python_2_unicode_compatible,
-                         values)
 from celery.loaders import get_loader_cls
 from celery.local import PromiseProxy, maybe_evaluate
 from celery.utils import abstract
@@ -35,13 +32,13 @@ from celery.utils.functional import first, head_from_fun, maybe_list
 from celery.utils.imports import gen_task_name, instantiate, symbol_by_name
 from celery.utils.log import get_logger
 from celery.utils.objects import FallbackContext, mro_lookup
-from celery.utils.time import (get_exponential_backoff_interval, timezone,
-                               to_utc)
+from celery.utils.time import timezone, to_utc
 
 # Load all builtin tasks
 from . import builtins  # noqa
 from . import backends
 from .annotations import prepare as prepare_annotations
+from .autoretry import add_autoretry_behaviour
 from .defaults import DEFAULT_SECURITY_DIGEST, find_deprecated_settings
 from .registry import TaskRegistry
 from .utils import (AppPickler, Settings, _new_key_to_old, _old_key_to_new,
@@ -141,8 +138,7 @@ class PendingConfiguration(UserDict, AttributeDictMixin):
         return self.callback()
 
 
-@python_2_unicode_compatible
-class Celery(object):
+class Celery:
     """Celery application.
 
     Arguments:
@@ -210,6 +206,8 @@ class Celery(object):
     task_cls = 'celery.app.task:Task'
     registry_cls = 'celery.app.registry:TaskRegistry'
 
+    #: Thread local storage.
+    _local = None
     _fixups = None
     _pool = None
     _conf = None
@@ -233,6 +231,9 @@ class Celery(object):
                  changes=None, config_source=None, fixups=None, task_cls=None,
                  autofinalize=True, namespace=None, strict_typing=True,
                  **kwargs):
+
+        self._local = threading.local()
+
         self.clock = LamportClock()
         self.main = main
         self.amqp_cls = amqp or self.amqp_cls
@@ -349,25 +350,34 @@ class Celery(object):
         _deregister_app(self)
 
     def start(self, argv=None):
-        """Run :program:`celery` using `argv`.
+        from celery.bin.celery import celery
 
-        Uses :data:`sys.argv` if `argv` is not specified.
-        """
-        return instantiate(
-            'celery.bin.celery:CeleryCommand', app=self
-        ).execute_from_commandline(argv)
+        celery.params[0].default = self
+
+        try:
+            celery.main(args=argv, standalone_mode=False)
+        except Exit as e:
+            return e.exit_code
+        finally:
+            celery.params[0].default = None
 
     def worker_main(self, argv=None):
-        """Run :program:`celery worker` using `argv`.
+        if argv is None:
+            argv = sys.argv
 
-        Uses :data:`sys.argv` if `argv` is not specified.
-        """
-        return instantiate(
-            'celery.bin.worker:worker', app=self
-        ).execute_from_commandline(argv)
+        if 'worker' not in argv:
+            raise ValueError(
+                "The worker sub-command must be specified in argv.\n"
+                "Use app.start() to programmatically start other commands."
+            )
+
+        self.start(argv=argv)
 
     def task(self, *args, **opts):
         """Decorator to create a task class out of any callable.
+
+        See :ref:`Task options<task-options>` for a list of the
+        arguments that can be passed to this decorator.
 
         Examples:
             .. code-block:: python
@@ -430,7 +440,7 @@ class Celery(object):
             raise TypeError('argument 1 to @task() must be a callable')
         if args:
             raise TypeError(
-                '@task() takes exactly 1 argument ({0} given)'.format(
+                '@task() takes exactly 1 argument ({} given)'.format(
                     sum([len(args), len(opts)])))
         return inner_create_task_cls(**opts)
 
@@ -449,6 +459,7 @@ class Celery(object):
                 '_decorated': True,
                 '__doc__': fun.__doc__,
                 '__module__': fun.__module__,
+                '__annotations__': fun.__annotations__,
                 '__header__': staticmethod(head_from_fun(fun, bound=bind)),
                 '__wrapped__': run}, **options))()
             # for some reason __qualname__ cannot be set in type()
@@ -459,30 +470,7 @@ class Celery(object):
                 pass
             self._tasks[task.name] = task
             task.bind(self)  # connects task to this app
-
-            autoretry_for = tuple(options.get('autoretry_for', ()))
-            retry_kwargs = options.get('retry_kwargs', {})
-            retry_backoff = int(options.get('retry_backoff', False))
-            retry_backoff_max = int(options.get('retry_backoff_max', 600))
-            retry_jitter = options.get('retry_jitter', True)
-
-            if autoretry_for and not hasattr(task, '_orig_run'):
-
-                @wraps(task.run)
-                def run(*args, **kwargs):
-                    try:
-                        return task._orig_run(*args, **kwargs)
-                    except autoretry_for as exc:
-                        if retry_backoff:
-                            retry_kwargs['countdown'] = \
-                                get_exponential_backoff_interval(
-                                    factor=retry_backoff,
-                                    retries=task.request.retries,
-                                    maximum=retry_backoff_max,
-                                    full_jitter=retry_jitter)
-                        raise task.retry(exc=exc, **retry_kwargs)
-
-                task._orig_run, task.run = task.run, run
+            add_autoretry_behaviour(task, **options)
         else:
             task = self._tasks[name]
         return task
@@ -495,10 +483,12 @@ class Celery(object):
             style task classes, you should not need to use this for
             new projects.
         """
+        task = inspect.isclass(task) and task() or task
         if not task.name:
             task_cls = type(task)
             task.name = self.gen_task_name(
                 task_cls.__name__, task_cls.__module__)
+        add_autoretry_behaviour(task)
         self.tasks[task.name] = task
         task._app = self
         task.bind(self)
@@ -524,7 +514,7 @@ class Celery(object):
                 while pending:
                     maybe_evaluate(pending.popleft())
 
-                for task in values(self._tasks):
+                for task in self._tasks.values():
                     task.bind(self)
 
                 self.on_after_finalize.send(sender=self)
@@ -661,7 +651,7 @@ class Celery(object):
             packages (List[str]): List of packages to search.
                 This argument may also be a callable, in which case the
                 value returned is used (for lazy evaluation).
-            related_name (str): The name of the module to find.  Defaults
+            related_name (Optional[str]): The name of the module to find.  Defaults
                 to "tasks": meaning "look for 'module.tasks' for every
                 module in ``packages``.".  If ``None`` will only try to import
                 the package, i.e. "look for 'module'".
@@ -690,15 +680,16 @@ class Celery(object):
     def _autodiscover_tasks_from_fixups(self, related_name):
         return self._autodiscover_tasks_from_names([
             pkg for fixup in self._fixups
-            for pkg in fixup.autodiscover_tasks()
             if hasattr(fixup, 'autodiscover_tasks')
+            for pkg in fixup.autodiscover_tasks()
         ], related_name=related_name)
 
     def send_task(self, name, args=None, kwargs=None, countdown=None,
                   eta=None, task_id=None, producer=None, connection=None,
                   router=None, result_cls=None, expires=None,
                   publisher=None, link=None, link_error=None,
-                  add_to_parent=True, group_id=None, retries=0, chord=None,
+                  add_to_parent=True, group_id=None, group_index=None,
+                  retries=0, chord=None,
                   reply_to=None, time_limit=None, soft_time_limit=None,
                   root_id=None, parent_id=None, route_name=None,
                   shadow=None, chain=None, task_type=None, **options):
@@ -738,10 +729,10 @@ class Celery(object):
                                        parent.request.delivery_info.get('priority'))
 
         message = amqp.create_task_message(
-            task_id, name, args, kwargs, countdown, eta, group_id,
+            task_id, name, args, kwargs, countdown, eta, group_id, group_index,
             expires, retries, chord,
             maybe_list(link), maybe_list(link_error),
-            reply_to or self.oid, time_limit, soft_time_limit,
+            reply_to or self.thread_oid, time_limit, soft_time_limit,
             self.conf.task_send_sent_event,
             root_id, parent_id, shadow, chain,
             argsrepr=options.get('argsrepr'),
@@ -1051,7 +1042,7 @@ class Celery(object):
         if not keep_reduce:
             attrs['__reduce__'] = __reduce__
 
-        return type(bytes_if_py2(name or Class.__name__), (Class,), attrs)
+        return type(name or Class.__name__, (Class,), attrs)
 
     def _rgetattr(self, path):
         return attrgetter(path)(self)
@@ -1063,7 +1054,7 @@ class Celery(object):
         self.close()
 
     def __repr__(self):
-        return '<{0} {1}>'.format(type(self).__name__, appstr(self))
+        return '<{} {}>'.format(type(self).__name__, appstr(self))
 
     def __reduce__(self):
         if self._using_v1_reduce:
@@ -1199,15 +1190,28 @@ class Celery(object):
         # which would not work if each thread has a separate id.
         return oid_from(self, threads=False)
 
+    @property
+    def thread_oid(self):
+        """Per-thread unique identifier for this app."""
+        try:
+            return self._local.oid
+        except AttributeError:
+            self._local.oid = new_oid = oid_from(self, threads=True)
+            return new_oid
+
     @cached_property
     def amqp(self):
         """AMQP related functionality: :class:`~@amqp`."""
         return instantiate(self.amqp_cls, app=self)
 
-    @cached_property
+    @property
     def backend(self):
         """Current backend instance."""
-        return self._get_backend()
+        try:
+            return self._local.backend
+        except AttributeError:
+            self._local.backend = new_backend = self._get_backend()
+            return new_backend
 
     @property
     def conf(self):

@@ -1,19 +1,17 @@
-# -*- coding: utf-8 -*-
-from __future__ import absolute_import, unicode_literals
-
 import os
+import pickle
 import tempfile
 
 import pytest
 
-from case import skip
+import t.skip
 from celery import states, uuid
 from celery.backends import filesystem
 from celery.backends.filesystem import FilesystemBackend
 from celery.exceptions import ImproperlyConfigured
 
 
-@skip.if_win32()
+@t.skip.if_win32
 class test_FilesystemBackend:
 
     def setup(self):
@@ -89,3 +87,8 @@ class test_FilesystemBackend:
         tb.mark_as_done(tid, 42)
         tb.forget(tid)
         assert len(os.listdir(self.directory)) == 0
+
+    @pytest.mark.usefixtures('depends_on_current_app')
+    def test_pickleable(self):
+        tb = FilesystemBackend(app=self.app, url=self.url, serializer='pickle')
+        assert pickle.loads(pickle.dumps(tb))

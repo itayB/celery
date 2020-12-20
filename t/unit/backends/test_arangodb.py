@@ -1,9 +1,9 @@
 """Tests for the ArangoDb."""
-from __future__ import absolute_import, unicode_literals
+import datetime
+from unittest.mock import Mock, patch, sentinel
 
 import pytest
 
-from case import Mock, patch, sentinel, skip
 from celery.app import backends
 from celery.backends import arangodb as module
 from celery.backends.arangodb import ArangoDbBackend
@@ -14,8 +14,9 @@ try:
 except ImportError:
     pyArango = None  # noqa
 
+pytest.importorskip('pyArango')
 
-@skip.unless_module('pyArango')
+
 class test_ArangoDbBackend:
 
     def setup(self):
@@ -105,3 +106,20 @@ class test_ArangoDbBackend:
             assert x.collection == 'celery_collection'
             assert x.http_protocol == 'http'
             assert x.arangodb_url == 'http://test.arangodb.com:8529'
+
+    def test_backend_cleanup(self):
+        now = datetime.datetime.utcnow()
+        self.backend.app.now = Mock(return_value=now)
+        self.backend._connection = {
+            'celery': Mock(),
+        }
+
+        self.backend.cleanup()
+
+        expected_date = (now - self.backend.expires_delta).isoformat()
+        expected_query = (
+            'FOR item IN celery '
+            'FILTER item.task.date_done < "{date}" '
+            'REMOVE item IN celery'
+        ).format(date=expected_date)
+        self.backend.db.AQLQuery.assert_called_once_with(expected_query)

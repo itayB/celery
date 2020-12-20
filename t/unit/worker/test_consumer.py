@@ -1,17 +1,15 @@
-from __future__ import absolute_import, unicode_literals
-
 import errno
 import socket
 from collections import deque
+from unittest.mock import Mock, call, patch
 
 import pytest
 from billiard.exceptions import RestartFreqExceeded
+from case import ContextMock
 
-from case import ContextMock, Mock, call, patch, skip
 from celery.utils.collections import LimitedSet
 from celery.worker.consumer.agent import Agent
-from celery.worker.consumer.consumer import (CLOSE, TERMINATE, Consumer,
-                                             dump_body)
+from celery.worker.consumer.consumer import CLOSE, TERMINATE, Consumer
 from celery.worker.consumer.gossip import Gossip
 from celery.worker.consumer.heart import Heart
 from celery.worker.consumer.mingle import Mingle
@@ -44,12 +42,6 @@ class test_Consumer:
     def test_taskbuckets_defaultdict(self):
         c = self.get_consumer()
         assert c.task_buckets['fooxasdwx.wewe'] is None
-
-    @skip.if_python3(reason='buffer type not available')
-    def test_dump_body_buffer(self):
-        msg = Mock()
-        msg.body = 'str'
-        assert dump_body(msg, buffer(msg.body))  # noqa: F821
 
     def test_sets_heartbeat(self):
         c = self.get_consumer(amqheartbeat=10)
@@ -263,6 +255,22 @@ class test_Consumer:
         conn.ensure_connection.assert_called()
         errback = conn.ensure_connection.call_args[0][0]
         errback(Mock(), 0)
+
+    @patch('celery.worker.consumer.consumer.error')
+    def test_connect_error_handler_progress(self, error):
+        self.app.conf.broker_connection_retry = True
+        self.app.conf.broker_connection_max_retries = 3
+        self.app._connection = _amqp_connection()
+        conn = self.app._connection.return_value
+        c = self.get_consumer()
+        assert c.connect()
+        errback = conn.ensure_connection.call_args[0][0]
+        errback(Mock(), 2)
+        assert error.call_args[0][3] == 'Trying again in 2.00 seconds... (1/3)'
+        errback(Mock(), 4)
+        assert error.call_args[0][3] == 'Trying again in 4.00 seconds... (2/3)'
+        errback(Mock(), 6)
+        assert error.call_args[0][3] == 'Trying again in 6.00 seconds... (3/3)'
 
 
 class test_Heart:

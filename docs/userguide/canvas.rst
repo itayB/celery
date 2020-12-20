@@ -298,7 +298,7 @@ The Primitives
 
         .. code-block:: pycon
 
-            >>> items = zip(xrange(1000), xrange(1000))  # 1000 items
+            >>> items = zip(range(1000), range(1000))  # 1000 items
             >>> add.chunks(items, 10)
 
         will split the list of items into chunks of 10, resulting in 100
@@ -344,7 +344,7 @@ Here's some examples:
 
         >>> add.signature((2, 2), immutable=True)
 
-    There's also a ``.si()`` shortcut for this, and this is the preffered way of
+    There's also a ``.si()`` shortcut for this, and this is the preferred way of
     creating signatures:
 
     .. code-block:: pycon
@@ -372,7 +372,7 @@ Here's some examples:
     .. code-block:: pycon
 
         >>> from celery import group
-        >>> res = group(add.s(i, i) for i in xrange(10))()
+        >>> res = group(add.s(i, i) for i in range(10))()
         >>> res.get(timeout=1)
         [0, 2, 4, 6, 8, 10, 12, 14, 16, 18]
 
@@ -385,7 +385,7 @@ Here's some examples:
     .. code-block:: pycon
 
         >>> from celery import chord
-        >>> res = chord((add.s(i, i) for i in xrange(10)), xsum.s())()
+        >>> res = chord((add.s(i, i) for i in range(10)), xsum.s())()
         >>> res.get()
         90
 
@@ -434,7 +434,7 @@ Here's some examples:
 
     .. code-block:: pycon
 
-        >>> c3 = (group(add.s(i, i) for i in xrange(10)) | xsum.s())
+        >>> c3 = (group(add.s(i, i) for i in range(10)) | xsum.s())
         >>> res = c3()
         >>> res.get()
         90
@@ -459,7 +459,7 @@ Here's some examples:
 
     .. code-block:: pycon
 
-        >>> res = (add.s(4, 4) | group(add.si(i, i) for i in xrange(10)))()
+        >>> res = (add.s(4, 4) | group(add.si(i, i) for i in range(10)))()
         >>> res.get()
         <GroupResult: de44df8c-821d-4c84-9a6a-44769c738f98 [
             bc01831b-9486-4e51-b046-480d7c9b78de,
@@ -491,10 +491,10 @@ returns successfully:
 
     >>> res = add.apply_async((2, 2), link=mul.s(16))
     >>> res.get()
-    64
+    4
 
 The linked task will be applied with the result of its parent
-task as the first argument. In the above case where the result was 64,
+task as the first argument. In the above case where the result was 4,
 this will result in ``mul(4, 16)``.
 
 The results will keep track of any subtasks called by the original task,
@@ -526,7 +526,7 @@ too:
 
 .. code-block:: pycon
 
-    >>> for result, value in res.collect(intermediate=True)):
+    >>> for result, value in res.collect(intermediate=True):
     ....
 
 You can link together as many tasks as you like,
@@ -569,7 +569,7 @@ Here's an example errback:
     def log_error(request, exc, traceback):
         with open(os.path.join('/var/errors', request.id), 'a') as fh:
             print('--\n\n{0} {1} {2}'.format(
-                task_id, exc, traceback), file=fh)
+                request.id, exc, traceback), file=fh)
 
 To make it even easier to link tasks together there's
 a special signature called :class:`~celery.chain` that lets
@@ -683,7 +683,7 @@ Group also supports iterators:
 
 .. code-block:: pycon
 
-    >>> group(add.s(i, i) for i in xrange(100))()
+    >>> group(add.s(i, i) for i in range(100))()
 
 A group is a signature object, so it can be used in combination
 with other signatures.
@@ -800,7 +800,7 @@ get the sum of the resulting numbers:
     >>> from tasks import add, tsum
 
     >>> chord(add.s(i, i)
-    ...       for i in xrange(100))(tsum.s()).get()
+    ...       for i in range(100))(tsum.s()).get()
     9900
 
 
@@ -809,7 +809,7 @@ synchronization makes this a lot slower than its Python counterpart:
 
 .. code-block:: pycon
 
-    >>> sum(i + i for i in xrange(100))
+    >>> sum(i + i for i in range(100))
 
 The synchronization step is costly, so you should avoid using chords as much
 as possible. Still, the chord is a powerful primitive to have in your toolbox
@@ -959,11 +959,11 @@ Map & Starmap
 -------------
 
 :class:`~celery.map` and :class:`~celery.starmap` are built-in tasks
-that calls the task for every element in a sequence.
+that call the provided calling task for every element in a sequence.
 
-They differ from group in that
+They differ from :class:`~celery.group` in that:
 
-- only one task message is sent
+- only one task message is sent.
 
 - the operation is sequential.
 
@@ -1013,7 +1013,7 @@ Chunks
 ------
 
 Chunking lets you divide an iterable of work into pieces, so that if
-you have one million objects, you can create 10 tasks with hundred
+you have one million objects, you can create 10 tasks with a hundred
 thousand objects each.
 
 Some may worry that chunking your tasks results in a degradation

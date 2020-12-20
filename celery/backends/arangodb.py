@@ -1,14 +1,12 @@
-# -*- coding: utf-8 -*-
 """ArangoDb result store backend."""
 
 # pylint: disable=W1202,W0703
 
-from __future__ import absolute_import, unicode_literals
-
 import json
 import logging
+from datetime import timedelta
 
-from kombu.utils.encoding import str_t
+from kombu.utils.objects import cached_property
 from kombu.utils.url import _parse_url
 
 from celery.exceptions import ImproperlyConfigured
@@ -52,11 +50,11 @@ class ArangoDbBackend(KeyValueStoreBackend):
     http_protocol = 'http'
 
     # Use str as arangodb key not bytes
-    key_t = str_t
+    key_t = str
 
     def __init__(self, url=None, *args, **kwargs):
         """Parse the url or load the settings from settings object."""
-        super(ArangoDbBackend, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
 
         if py_arango_connection is None:
             raise ImproperlyConfigured(
@@ -114,6 +112,10 @@ class ArangoDbBackend(KeyValueStoreBackend):
     def db(self):
         """Database Object to the given database."""
         return self.connection[self.database]
+
+    @cached_property
+    def expires_delta(self):
+        return timedelta(seconds=self.expires)
 
     def get(self, key):
         try:
@@ -206,6 +208,22 @@ class ArangoDbBackend(KeyValueStoreBackend):
                     key=key, collection=self.collection
                 )
             )
+        except AQLQueryError as aql_err:
+            logging.error(aql_err)
+        except Exception as err:
+            logging.error(err)
+
+    def cleanup(self):
+        """Delete expired meta-data."""
+        remove_before = (self.app.now() - self.expires_delta).isoformat()
+        try:
+            query = (
+                'FOR item IN {collection} '
+                'FILTER item.task.date_done < "{remove_before}" '
+                'REMOVE item IN {collection}'
+            ).format(collection=self.collection, remove_before=remove_before)
+            logging.debug(query)
+            self.db.AQLQuery(query)
         except AQLQueryError as aql_err:
             logging.error(aql_err)
         except Exception as err:

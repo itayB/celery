@@ -1,14 +1,12 @@
-# -*- coding: utf-8 -*-
 """Trace task execution.
 
 This module defines how the task execution is traced:
 errors are recorded, handlers are applied and so on.
 """
-from __future__ import absolute_import, unicode_literals
-
 import logging
 import os
 import sys
+import time
 from collections import namedtuple
 from warnings import warn
 
@@ -23,7 +21,6 @@ from celery._state import _task_stack
 from celery.app.task import Context
 from celery.app.task import Task as BaseTask
 from celery.exceptions import Ignore, InvalidTaskError, Reject, Retry
-from celery.five import monotonic, text_t
 from celery.utils.log import get_logger
 from celery.utils.nodenames import gethostname
 from celery.utils.objects import mro_lookup
@@ -82,7 +79,8 @@ Task %(name)s[%(id)s] retry: %(exc)s\
 """
 
 log_policy_t = namedtuple(
-    'log_policy_t', ('format', 'description', 'severity', 'traceback', 'mail'),
+    'log_policy_t',
+    ('format', 'description', 'severity', 'traceback', 'mail'),
 )
 
 log_policy_reject = log_policy_t(LOG_REJECTED, 'rejected', logging.WARN, 1, 1)
@@ -150,7 +148,7 @@ def get_task_name(request, default):
     return getattr(request, 'shadow', None) or default
 
 
-class TraceInfo(object):
+class TraceInfo:
     """Information about task execution."""
 
     __slots__ = ('state', 'retval')
@@ -195,7 +193,7 @@ class TraceInfo(object):
             info(LOG_RETRY, {
                 'id': req.id,
                 'name': get_task_name(req, task.name),
-                'exc': text_t(reason),
+                'exc': str(reason),
             })
             return einfo
         finally:
@@ -256,9 +254,31 @@ class TraceInfo(object):
                    extra={'data': context})
 
 
+def traceback_clear(exc=None):
+    # Cleared Tb, but einfo still has a reference to Traceback.
+    # exc cleans up the Traceback at the last moment that can be revealed.
+    tb = None
+    if exc is not None:
+        if hasattr(exc, '__traceback__'):
+            tb = exc.__traceback__
+        else:
+            _, _, tb = sys.exc_info()
+    else:
+        _, _, tb = sys.exc_info()
+
+    while tb is not None:
+        try:
+            tb.tb_frame.clear()
+            tb.tb_frame.f_locals
+        except RuntimeError:
+            # Ignore the exception raised if the frame is still executing.
+            pass
+        tb = tb.tb_next
+
+
 def build_tracer(name, task, loader=None, hostname=None, store_errors=True,
                  Info=TraceInfo, eager=False, propagate=False, app=None,
-                 monotonic=monotonic, trace_ok_t=trace_ok_t,
+                 monotonic=time.monotonic, trace_ok_t=trace_ok_t,
                  IGNORE_STATES=IGNORE_STATES):
     """Return a function that traces task execution.
 
@@ -388,15 +408,19 @@ def build_tracer(name, task, loader=None, hostname=None, store_errors=True,
                     I, R = Info(REJECTED, exc), ExceptionInfo(internal=True)
                     state, retval = I.state, I.retval
                     I.handle_reject(task, task_request)
+                    traceback_clear(exc)
                 except Ignore as exc:
                     I, R = Info(IGNORED, exc), ExceptionInfo(internal=True)
                     state, retval = I.state, I.retval
                     I.handle_ignore(task, task_request)
+                    traceback_clear(exc)
                 except Retry as exc:
                     I, R, state, retval = on_error(
                         task_request, exc, uuid, RETRY, call_errbacks=False)
+                    traceback_clear(exc)
                 except Exception as exc:
                     I, R, state, retval = on_error(task_request, exc, uuid)
+                    traceback_clear(exc)
                 except BaseException:
                     raise
                 else:
@@ -492,6 +516,7 @@ def build_tracer(name, task, loader=None, hostname=None, store_errors=True,
         except MemoryError:
             raise
         except Exception as exc:
+            _signal_internal_error(task, uuid, args, kwargs, request, exc)
             if eager:
                 raise
             R = report_internal_error(task, exc)
@@ -510,7 +535,29 @@ def trace_task(task, uuid, args, kwargs, request=None, **opts):
             task.__trace__ = build_tracer(task.name, task, **opts)
         return task.__trace__(uuid, args, kwargs, request)
     except Exception as exc:
-        return trace_ok_t(report_internal_error(task, exc), None, 0.0, None)
+        _signal_internal_error(task, uuid, args, kwargs, request, exc)
+        return trace_ok_t(report_internal_error(task, exc), TraceInfo(FAILURE, exc), 0.0, None)
+
+
+def _signal_internal_error(task, uuid, args, kwargs, request, exc):
+    """Send a special `internal_error` signal to the app for outside body errors."""
+    try:
+        _, _, tb = sys.exc_info()
+        einfo = ExceptionInfo()
+        einfo.exception = get_pickleable_exception(einfo.exception)
+        einfo.type = get_pickleable_etype(einfo.type)
+        signals.task_internal_error.send(
+            sender=task,
+            task_id=uuid,
+            args=args,
+            kwargs=kwargs,
+            request=request,
+            exception=exc,
+            traceback=tb,
+            einfo=einfo,
+        )
+    finally:
+        del tb
 
 
 def _trace_task_ret(name, uuid, request, body, content_type,
@@ -566,7 +613,7 @@ def report_internal_error(task, exc):
         _value = task.backend.prepare_exception(exc, 'pickle')
         exc_info = ExceptionInfo((_type, _value, _tb), internal=True)
         warn(RuntimeWarning(
-            'Exception raised outside body: {0!r}:\n{1}'.format(
+            'Exception raised outside body: {!r}:\n{}'.format(
                 exc, exc_info.traceback)))
         return exc_info
     finally:

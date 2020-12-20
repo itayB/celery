@@ -23,7 +23,7 @@ You can start the worker in the foreground by executing the command:
 
 .. code-block:: console
 
-    $ celery -A proj worker -l info
+    $ celery -A proj worker -l INFO
 
 For a full list of available command-line options see
 :mod:`~celery.bin.worker`, or simply do:
@@ -95,7 +95,7 @@ longer version:
 
 .. code-block:: console
 
-    $ ps auxww | grep 'celery worker' | awk '{print $2}' | xargs kill -9
+    $ ps auxww | awk '/celery worker/ {print $2}' | xargs kill -9
 
 .. _worker-restarting:
 
@@ -108,7 +108,7 @@ is by using `celery multi`:
 
 .. code-block:: console
 
-    $ celery multi start 1 -A proj -l info -c4 --pidfile=/var/run/celery/%n.pid
+    $ celery multi start 1 -A proj -l INFO -c4 --pidfile=/var/run/celery/%n.pid
     $ celery multi restart 1 --pidfile=/var/run/celery/%n.pid
 
 For production deployments you should be using init-scripts or a process
@@ -244,7 +244,7 @@ Remote control
     commands from the command-line. It supports all of the commands
     listed below. See :ref:`monitoring-control` for more information.
 
-:pool support: *prefork, eventlet, gevent*, blocking:*solo* (see note)
+:pool support: *prefork, eventlet, gevent, thread*, blocking:*solo* (see note)
 :broker support: *amqp, redis*
 
 Workers have the ability to be remote controlled using a high-priority
@@ -410,7 +410,7 @@ argument to :program:`celery worker`:
 
 .. code-block:: console
 
-    $ celery -A proj worker -l info --statedb=/var/run/celery/worker.state
+    $ celery -A proj worker -l INFO --statedb=/var/run/celery/worker.state
 
 or if you use :program:`celery multi` you want to create one file per
 worker instance so use the `%n` format to expand the current node
@@ -418,7 +418,7 @@ name:
 
 .. code-block:: console
 
-    celery multi start 2 -l info --statedb=/var/run/celery/%n.state
+    celery multi start 2 -l INFO --statedb=/var/run/celery/%n.state
 
 
 See also :ref:`worker-files`
@@ -611,7 +611,7 @@ separated list of queues to the :option:`-Q <celery worker -Q>` option:
 
 .. code-block:: console
 
-    $ celery -A proj worker -l info -Q foo,bar,baz
+    $ celery -A proj worker -l INFO -Q foo,bar,baz
 
 If the queue name is defined in :setting:`task_queues` it will use that
 configuration, but if it's not defined in the list of queues Celery will
@@ -924,6 +924,10 @@ The output will include the following fields:
     Value of the workers logical clock. This is a positive integer and should
     be increasing every time you receive statistics.
 
+- ``uptime``
+
+    Numbers of seconds since the worker controller was started
+
 - ``pid``
 
     Process id of the worker instance (Main process).
@@ -1157,7 +1161,7 @@ for example one that reads the current prefetch count:
 
     from celery.worker.control import inspect_command
 
-    @inspect_command
+    @inspect_command()
     def current_prefetch_count(state):
         return {'prefetch_count': state.consumer.qos.value}
 

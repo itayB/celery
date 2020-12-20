@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Version of multiprocessing.Pool using Async I/O.
 
 .. note::
@@ -13,19 +12,16 @@ This code deals with three major challenges:
 #. Sending jobs to the processes and receiving results back.
 #. Safely shutting down this system.
 """
-from __future__ import absolute_import, unicode_literals
-
 import errno
 import gc
 import os
 import select
-import socket
-import sys
 import time
-from collections import deque, namedtuple
+from collections import Counter, deque, namedtuple
 from io import BytesIO
 from numbers import Integral
 from pickle import HIGHEST_PROTOCOL
+from struct import pack, unpack, unpack_from
 from time import sleep
 from weakref import WeakValueDictionary, ref
 
@@ -39,8 +35,6 @@ from kombu.utils.eventio import SELECT_BAD_FD
 from kombu.utils.functional import fxrange
 from vine import promise
 
-from celery.five import Counter, items, values
-from celery.platforms import pack, unpack, unpack_from
 from celery.utils.functional import noop
 from celery.utils.log import get_logger
 from celery.worker import state as worker_state
@@ -51,12 +45,6 @@ from celery.worker import state as worker_state
 try:
     from _billiard import read as __read__
     readcanbuf = True
-
-    # unpack_from supports memoryview in 2.7.6 and 3.3+
-    if sys.version_info[0] == 2 and sys.version_info < (2, 7, 6):
-
-        def unpack_from(fmt, view, _unpack_from=unpack_from):  # noqa
-            return _unpack_from(fmt, view.tobytes())  # <- memoryview
 
 except ImportError:  # pragma: no cover
 
@@ -89,6 +77,7 @@ SCHED_STRATEGY_FAIR = 4
 
 SCHED_STRATEGIES = {
     None: SCHED_STRATEGY_FAIR,
+    'default': SCHED_STRATEGY_FAIR,
     'fast': SCHED_STRATEGY_FCFS,
     'fcfs': SCHED_STRATEGY_FCFS,
     'fair': SCHED_STRATEGY_FAIR,
@@ -174,14 +163,8 @@ def _select(readers=None, writers=None, err=None, timeout=0,
     err = set() if err is None else err
     try:
         return poll(readers, writers, err, timeout)
-    except (select.error, socket.error) as exc:
-        # Workaround for celery/celery#4513
-        # TODO: Remove the fallback to the first arg of the exception
-        # once we drop Python 2.7.
-        try:
-            _errno = exc.errno
-        except AttributeError:
-            _errno = exc.args[0]
+    except OSError as exc:
+        _errno = exc.errno
 
         if _errno == errno.EINTR:
             return set(), set(), 1
@@ -189,11 +172,8 @@ def _select(readers=None, writers=None, err=None, timeout=0,
             for fd in readers | writers | err:
                 try:
                     select.select([fd], [], [], 0)
-                except (select.error, socket.error) as exc:
-                    try:
-                        _errno = exc.errno
-                    except AttributeError:
-                        _errno = exc.args[0]
+                except OSError as exc:
+                    _errno = exc.errno
 
                     if _errno not in SELECT_BAD_FD:
                         raise
@@ -203,12 +183,6 @@ def _select(readers=None, writers=None, err=None, timeout=0,
             return set(), set(), 1
         else:
             raise
-
-
-try:  # TODO Delete when drop py2 support as FileNotFoundError is py3
-    FileNotFoundError
-except NameError:
-    FileNotFoundError = IOError
 
 
 def iterate_file_descriptors_safely(fds_iter, source_data,
@@ -272,7 +246,7 @@ class ResultHandler(_pool.ResultHandler):
     def __init__(self, *args, **kwargs):
         self.fileno_to_outq = kwargs.pop('fileno_to_outq')
         self.on_process_alive = kwargs.pop('on_process_alive')
-        super(ResultHandler, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
         # add our custom message handler
         self.state_handlers[WORKER_UP] = self.on_process_alive
 
@@ -351,7 +325,7 @@ class ResultHandler(_pool.ResultHandler):
                 next(it)
             except StopIteration:
                 pass
-            except (IOError, OSError, EOFError):
+            except (OSError, EOFError):
                 remove_reader(fileno)
             else:
                 add_reader(fileno, it)
@@ -405,7 +379,7 @@ class ResultHandler(_pool.ResultHandler):
         reader = proc.outq._reader
         try:
             setblocking(reader, 1)
-        except (OSError, IOError):
+        except OSError:
             return remove(fd)
         try:
             if reader.poll(0):
@@ -413,7 +387,7 @@ class ResultHandler(_pool.ResultHandler):
             else:
                 task = None
                 sleep(0.5)
-        except (IOError, EOFError):
+        except (OSError, EOFError):
             return remove(fd)
         else:
             if task:
@@ -421,7 +395,7 @@ class ResultHandler(_pool.ResultHandler):
         finally:
             try:
                 setblocking(reader, 0)
-            except (OSError, IOError):
+            except OSError:
                 return remove(fd)
 
 
@@ -432,7 +406,7 @@ class AsynPool(_pool.Pool):
     Worker = Worker
 
     def WorkerProcess(self, worker):
-        worker = super(AsynPool, self).WorkerProcess(worker)
+        worker = super().WorkerProcess(worker)
         worker.dead = False
         return worker
 
@@ -483,7 +457,7 @@ class AsynPool(_pool.Pool):
 
         self.write_stats = Counter()
 
-        super(AsynPool, self).__init__(processes, *args, **kwargs)
+        super().__init__(processes, *args, **kwargs)
 
         for proc in self._pool:
             # create initial mappings, these will be updated
@@ -500,7 +474,7 @@ class AsynPool(_pool.Pool):
 
     def _create_worker_process(self, i):
         gc.collect()  # Issue #2927
-        return super(AsynPool, self)._create_worker_process(i)
+        return super()._create_worker_process(i)
 
     def _event_process_exit(self, hub, proc):
         # This method is called whenever the process sentinel is readable.
@@ -546,7 +520,7 @@ class AsynPool(_pool.Pool):
 
         # Timers include calling maintain_pool at a regular interval
         # to be certain processes are restarted.
-        for handler, interval in items(self.timers):
+        for handler, interval in self.timers.items():
             hub.call_repeatedly(interval, handler)
 
         hub.on_tick.add(self.on_poll_start)
@@ -644,7 +618,7 @@ class AsynPool(_pool.Pool):
             # job._write_to and job._scheduled_for attributes used to recover
             # message boundaries when processes exit.
             infd = proc.inqW_fd
-            for job in values(cache):
+            for job in cache.values():
                 if job._write_to and job._write_to.inqW_fd == infd:
                     job._write_to = proc
                 if job._scheduled_for and job._scheduled_for.inqW_fd == infd:
@@ -673,7 +647,7 @@ class AsynPool(_pool.Pool):
             # another processes fds, as the fds may be reused.
             try:
                 fd = obj.fileno()
-            except (IOError, OSError):
+            except OSError:
                 return
 
             try:
@@ -775,9 +749,6 @@ class AsynPool(_pool.Pool):
         def on_poll_start():
             # Determine which io descriptors are not busy
             inactive = diff(active_writes)
-            logger.debug(
-                "AsyncPool._create_write_handlers ALL: %r ACTIVE: %r",
-                len(all_inqueues), len(active_writes))
 
             # Determine hub_add vs hub_remove strategy conditional
             if is_fair_strategy:
@@ -1008,7 +979,7 @@ class AsynPool(_pool.Pool):
         if self._state == TERMINATE:
             return
         # cancel all tasks that haven't been accepted so that NACK is sent.
-        for job in values(self._cache):
+        for job in self._cache.values():
             if not job._accepted:
                 job._cancel()
 
@@ -1027,7 +998,7 @@ class AsynPool(_pool.Pool):
                 # flush outgoing buffers
                 intervals = fxrange(0.01, 0.1, 0.01, repeatlast=True)
                 owned_by = {}
-                for job in values(self._cache):
+                for job in self._cache.values():
                     writer = _get_job_writer(job)
                     if writer is not None:
                         owned_by[writer] = job
@@ -1078,7 +1049,7 @@ class AsynPool(_pool.Pool):
                 if not again and (writable or readable):
                     try:
                         next(writer)
-                    except (StopIteration, OSError, IOError, EOFError):
+                    except (StopIteration, OSError, EOFError):
                         break
         finally:
             self._active_writers.discard(writer)
@@ -1089,7 +1060,7 @@ class AsynPool(_pool.Pool):
         Here we'll find an unused slot, as there should always
         be one available when we start a new process.
         """
-        return next(q for q, owner in items(self._queues)
+        return next(q for q, owner in self._queues.items()
                     if owner is None)
 
     def on_grow(self, n):
@@ -1159,11 +1130,11 @@ class AsynPool(_pool.Pool):
     def human_write_stats(self):
         if self.write_stats is None:
             return 'N/A'
-        vals = list(values(self.write_stats))
+        vals = list(self.write_stats.values())
         total = sum(vals)
 
         def per(v, total):
-            return '{0:.2%}'.format((float(v) / total) if v else 0)
+            return f'{(float(v) / total) if v else 0:.2f}'
 
         return {
             'total': total,
@@ -1193,7 +1164,7 @@ class AsynPool(_pool.Pool):
         for proc in task_handler.pool:
             try:
                 setblocking(proc.inq._writer, 1)
-            except (OSError, IOError):
+            except OSError:
                 pass
             else:
                 try:
@@ -1203,7 +1174,7 @@ class AsynPool(_pool.Pool):
                         raise
 
     def create_result_handler(self):
-        return super(AsynPool, self).create_result_handler(
+        return super().create_result_handler(
             fileno_to_outq=self._fileno_to_outq,
             on_process_alive=self.on_process_alive,
         )
@@ -1218,7 +1189,7 @@ class AsynPool(_pool.Pool):
     def _find_worker_queues(self, proc):
         """Find the queues owned by ``proc``."""
         try:
-            return next(q for q, owner in items(self._queues)
+            return next(q for q, owner in self._queues.items()
                         if owner == proc)
         except StopIteration:
             raise ValueError(proc)
@@ -1250,7 +1221,7 @@ class AsynPool(_pool.Pool):
             if readable:
                 try:
                     task = resq.recv()
-                except (OSError, IOError, EOFError) as exc:
+                except (OSError, EOFError) as exc:
                     _errno = getattr(exc, 'errno', None)
                     if _errno == errno.EINTR:
                         continue
@@ -1309,7 +1280,7 @@ class AsynPool(_pool.Pool):
             removed = 0
         try:
             self.on_inqueue_close(queues[0]._writer.fileno(), proc)
-        except IOError:
+        except OSError:
             pass
         for queue in queues:
             if queue:
@@ -1318,7 +1289,7 @@ class AsynPool(_pool.Pool):
                         self.hub_remove(sock)
                         try:
                             sock.close()
-                        except (IOError, OSError):
+                        except OSError:
                             pass
         return removed
 
@@ -1353,7 +1324,7 @@ class AsynPool(_pool.Pool):
                 fd = w.inq._reader.fileno()
                 inqR.add(fd)
                 fileno_to_proc[fd] = w
-            except IOError:
+            except OSError:
                 pass
         while inqR:
             readable, _, again = _select(inqR, timeout=0.5)

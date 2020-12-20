@@ -1,8 +1,4 @@
-# -*- coding: utf-8 -*-
 """Task implementation: request context and the task base class."""
-from __future__ import absolute_import, unicode_literals
-
-import signal
 import sys
 
 from billiard.einfo import ExceptionInfo
@@ -12,16 +8,14 @@ from kombu.utils.uuid import uuid
 
 from celery import current_app, group, states
 from celery._state import _task_stack
-from celery.canvas import signature
+from celery.canvas import _chain, signature
 from celery.exceptions import (Ignore, ImproperlyConfigured,
                                MaxRetriesExceededError, Reject, Retry)
-from celery.five import items, python_2_unicode_compatible
 from celery.local import class_property
 from celery.result import EagerResult, denied_join_result
 from celery.utils import abstract
 from celery.utils.functional import mattrgetter, maybe_list
 from celery.utils.imports import instantiate
-from celery.utils.log import get_logger
 from celery.utils.nodenames import gethostname
 from celery.utils.serialization import raise_with_context
 
@@ -49,7 +43,7 @@ TaskType = type
 
 def _strflags(flags, default=''):
     if flags:
-        return ' ({0})'.format(', '.join(flags))
+        return ' ({})'.format(', '.join(flags))
     return default
 
 
@@ -64,8 +58,7 @@ def _reprtask(task, fmt=None, flags=None):
     )
 
 
-@python_2_unicode_compatible
-class Context(object):
+class Context:
     """Task request variables (Task.request)."""
 
     logfile = None
@@ -86,6 +79,7 @@ class Context(object):
     correlation_id = None
     taskset = None   # compat alias to group
     group = None
+    group_index = None
     chord = None
     chain = None
     utc = None
@@ -110,7 +104,7 @@ class Context(object):
         return getattr(self, key, default)
 
     def __repr__(self):
-        return '<Context: {0!r}>'.format(vars(self))
+        return '<Context: {!r}>'.format(vars(self))
 
     def as_execution_options(self):
         limit_hard, limit_soft = self.timelimit or (None, None)
@@ -119,6 +113,7 @@ class Context(object):
             'root_id': self.root_id,
             'parent_id': self.parent_id,
             'group_id': self.group,
+            'group_index': self.group_index,
             'chord': self.chord,
             'chain': self.chain,
             'link': self.callbacks,
@@ -141,8 +136,7 @@ class Context(object):
 
 
 @abstract.CallableTask.register
-@python_2_unicode_compatible
-class Task(object):
+class Task:
     """Task base class.
 
     Note:
@@ -211,7 +205,7 @@ class Task(object):
     store_errors_even_if_ignored = None
 
     #: The name of a serializer that are registered with
-    #: :mod:`kombu.serialization.registry`.  Default is `'pickle'`.
+    #: :mod:`kombu.serialization.registry`.  Default is `'json'`.
     serializer = None
 
     #: Hard time limit.
@@ -372,7 +366,7 @@ class Task(object):
     @classmethod
     def annotate(cls):
         for d in resolve_all_annotations(cls.app.annotations, cls):
-            for key, value in items(d):
+            for key, value in d.items():
                 if key.startswith('@'):
                     cls.add_around(key[1:], value)
                 else:
@@ -388,12 +382,6 @@ class Task(object):
         setattr(cls, attr, meth)
 
     def __call__(self, *args, **kwargs):
-        logger = get_logger(__name__)
-
-        def handle_sigterm(signum, frame):
-            logger.info('SIGTERM received, waiting till the task finished')
-
-        signal.signal(signal.SIGTERM, handle_sigterm)
         _task_stack.push(self)
         self.push_request(args=args, kwargs=kwargs)
         try:
@@ -552,11 +540,12 @@ class Task(object):
         app = self._get_app()
         if app.conf.task_always_eager:
             with app.producer_or_acquire(producer) as eager_producer:
-                serializer = options.get(
-                    'serializer',
-                    (eager_producer.serializer if eager_producer.serializer
-                     else app.conf.task_serializer)
-                )
+                serializer = options.get('serializer')
+                if serializer is None:
+                    if eager_producer.serializer:
+                        serializer = eager_producer.serializer
+                    else:
+                        serializer = app.conf.task_serializer
                 body = args, kwargs
                 content_type, content_encoding, data = serialization.dumps(
                     body, serializer,
@@ -603,10 +592,13 @@ class Task(object):
         args = request.args if args is None else args
         kwargs = request.kwargs if kwargs is None else kwargs
         options = request.as_execution_options()
+        delivery_info = request.delivery_info or {}
+        priority = delivery_info.get('priority')
+        if priority is not None:
+            options['priority'] = priority
         if queue:
             options['queue'] = queue
         else:
-            delivery_info = request.delivery_info or {}
             exchange = delivery_info.get('exchange')
             routing_key = delivery_info.get('routing_key')
             if exchange == '' and routing_key:
@@ -634,7 +626,7 @@ class Task(object):
             ...         twitter.post_status_update(message)
             ...     except twitter.FailWhale as exc:
             ...         # Retry in 5 minutes.
-            ...         raise self.retry(countdown=60 * 5, exc=exc)
+            ...         self.retry(countdown=60 * 5, exc=exc)
 
         Note:
             Although the task will never return above as `retry` raises an
@@ -683,6 +675,8 @@ class Task(object):
         """
         request = self.request
         retries = request.retries + 1
+        if max_retries is not None:
+            self.override_max_retries = max_retries
         max_retries = self.max_retries if max_retries is None else max_retries
 
         # Not in worker or emulated by (apply/always_eager),
@@ -708,17 +702,16 @@ class Task(object):
                 # the exc' argument provided (raise exc from orig)
                 raise_with_context(exc)
             raise self.MaxRetriesExceededError(
-                "Can't retry {0}[{1}] args:{2} kwargs:{3}".format(
+                "Can't retry {}[{}] args:{} kwargs:{}".format(
                     self.name, request.id, S.args, S.kwargs
                 ), task_args=S.args, task_kwargs=S.kwargs
             )
 
-        ret = Retry(exc=exc, when=eta or countdown)
+        ret = Retry(exc=exc, when=eta or countdown, is_eager=is_eager, sig=S)
 
         if is_eager:
             # if task was executed eagerly using apply(),
-            # then the retry must also be executed eagerly.
-            S.apply().get()
+            # then the retry must also be executed eagerly in apply method
             if throw:
                 raise ret
             return ret
@@ -781,11 +774,13 @@ class Task(object):
         retval = ret.retval
         if isinstance(retval, ExceptionInfo):
             retval, tb = retval.exception, retval.traceback
+        if isinstance(retval, Retry) and retval.sig is not None:
+            return retval.sig.apply(retries=retries + 1)
         state = states.SUCCESS if ret.info is None else ret.info.state
         return EagerResult(task_id, retval, state, traceback=tb)
 
     def AsyncResult(self, task_id, **kwargs):
-        """Get AsyncResult instance for this kind of task.
+        """Get AsyncResult instance for the specified task.
 
         Arguments:
             task_id (str): Task id to get result for.
@@ -872,7 +867,7 @@ class Task(object):
             sig (~@Signature): signature to replace with.
 
         Raises:
-            ~@Ignore: This is always raised when called in asynchrous context.
+            ~@Ignore: This is always raised when called in asynchronous context.
             It is best to always use ``return self.replace(...)`` to convey
             to the reader that the task won't continue after being replaced.
         """
@@ -887,14 +882,31 @@ class Task(object):
                 link=self.request.callbacks,
                 link_error=self.request.errbacks,
             )
+        elif isinstance(sig, _chain):
+            if not sig.tasks:
+                raise ImproperlyConfigured(
+                    "Cannot replace with an empty chain"
+                )
 
         if self.request.chain:
+            # We need to freeze the new signature with the current task's ID to
+            # ensure that we don't disassociate the new chain from the existing
+            # task IDs which would break previously constructed results
+            # objects.
+            sig.freeze(self.request.id)
+            if "link" in sig.options:
+                final_task_links = sig.tasks[-1].options.setdefault("link", [])
+                final_task_links.extend(maybe_list(sig.options["link"]))
+            # Construct the new remainder of the task by chaining the signature
+            # we're being replaced by with signatures constructed from the
+            # chain elements in the current request.
             for t in reversed(self.request.chain):
                 sig |= signature(t, app=self.app)
 
         sig.set(
             chord=chord,
             group_id=self.request.group,
+            group_index=self.request.group_index,
             root_id=self.request.root_id,
         )
         sig.freeze(self.request.id)
@@ -921,6 +933,7 @@ class Task(object):
             raise ValueError('Current task is not member of any chord')
         sig.set(
             group_id=self.request.group,
+            group_index=self.request.group_index,
             chord=self.request.chord,
             root_id=self.request.root_id,
         )

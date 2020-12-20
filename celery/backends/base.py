@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Result backend base classes.
 
 - :class:`BaseBackend` defines the interface.
@@ -6,12 +5,11 @@
 - :class:`KeyValueStoreBackend` is a common base class
     using K/V semantics like _get and _put.
 """
-from __future__ import absolute_import, unicode_literals
-
-import datetime
 import sys
 import time
+import warnings
 from collections import namedtuple
+from datetime import datetime, timedelta
 from functools import partial
 from weakref import WeakValueDictionary
 
@@ -24,18 +22,20 @@ from kombu.utils.url import maybe_sanitize_url
 import celery.exceptions
 from celery import current_app, group, maybe_signature, states
 from celery._state import get_current_task
-from celery.exceptions import (ChordError, ImproperlyConfigured,
+from celery.exceptions import (BackendGetMetaError, BackendStoreError,
+                               ChordError, ImproperlyConfigured,
                                NotRegistered, TaskRevokedError, TimeoutError)
-from celery.five import PY3, items
-from celery.result import (GroupResult, ResultBase, allow_join_result,
-                           result_from_tuple)
+from celery.result import (GroupResult, ResultBase, ResultSet,
+                           allow_join_result, result_from_tuple)
 from celery.utils.collections import BufferMap
 from celery.utils.functional import LRUCache, arity_greater
 from celery.utils.log import get_logger
 from celery.utils.serialization import (create_exception_cls,
                                         ensure_serializable,
                                         get_pickleable_exception,
-                                        get_pickled_exception)
+                                        get_pickled_exception,
+                                        raise_with_context)
+from celery.utils.time import get_exponential_backoff_interval
 
 __all__ = ('BaseBackend', 'KeyValueStoreBackend', 'DisabledBackend')
 
@@ -76,7 +76,7 @@ class _nulldict(dict):
     __setitem__ = update = setdefault = ignore
 
 
-class Backend(object):
+class Backend:
     READY_STATES = states.READY_STATES
     UNREADY_STATES = states.UNREADY_STATES
     EXCEPTION_STATES = states.EXCEPTION_STATES
@@ -124,6 +124,11 @@ class Backend(object):
         self.accept = conf.result_accept_content if accept is None else accept
         self.accept = conf.accept_content if self.accept is None else self.accept  # noqa: E501
         self.accept = prepare_accept_content(self.accept)
+
+        self.always_retry = conf.get('result_backend_always_retry', False)
+        self.max_sleep_between_retries_ms = conf.get('result_backend_max_sleep_between_retries_ms', 10000)
+        self.base_sleep_between_retries_ms = conf.get('result_backend_base_sleep_between_retries_ms', 10)
+        self.max_retries = conf.get('result_backend_max_retries', float("inf"))
 
         self._pending_results = pending_results_t({}, WeakValueDictionary())
         self._pending_messages = BufferMap(MESSAGE_BUFFER_MAX)
@@ -200,9 +205,15 @@ class Backend(object):
             # need to do so if the errback only takes a single task_id arg.
             task_id = request.id
             root_id = request.root_id or task_id
-            group(old_signature, app=self.app).apply_async(
-                (task_id,), parent_id=task_id, root_id=root_id
-            )
+            g = group(old_signature, app=self.app)
+            if self.app.conf.task_always_eager or request.delivery_info.get('is_eager', False):
+                g.apply(
+                    (task_id,), parent_id=task_id, root_id=root_id
+                )
+            else:
+                g.apply_async(
+                    (task_id,), parent_id=task_id, root_id=root_id
+                )
 
     def mark_as_revoked(self, task_id, reason='',
                         request=None, store_result=True, state=states.REVOKED):
@@ -250,6 +261,15 @@ class Backend(object):
             self.mark_as_failure(task_id, exc, exception_info.traceback)
             return exception_info
         finally:
+            while tb is not None:
+                try:
+                    tb.tb_frame.clear()
+                    tb.tb_frame.f_locals
+                except RuntimeError:
+                    # Ignore the exception raised if the frame is still executing.
+                    pass
+                tb = tb.tb_next
+
             del tb
 
     def prepare_exception(self, exc, serializer=None):
@@ -257,9 +277,10 @@ class Backend(object):
         serializer = self.serializer if serializer is None else serializer
         if serializer in EXCEPTION_ABLE_CODECS:
             return get_pickleable_exception(exc)
-        return {'exc_type': type(exc).__name__,
+        exctype = type(exc)
+        return {'exc_type': getattr(exctype, '__qualname__', exctype.__name__),
                 'exc_message': ensure_serializable(exc.args, self.encode),
-                'exc_module': type(exc).__module__}
+                'exc_module': exctype.__module__}
 
     def exception_to_python(self, exc):
         """Convert serialized exception to Python exception."""
@@ -273,7 +294,11 @@ class Backend(object):
                     exc_module = from_utf8(exc_module)
                     exc_type = from_utf8(exc['exc_type'])
                     try:
-                        cls = getattr(sys.modules[exc_module], exc_type)
+                        # Load module and find exception class in that
+                        cls = sys.modules[exc_module]
+                        # The type can contain qualified name with parent classes
+                        for name in exc_type.split('.'):
+                            cls = getattr(cls, name)
                     except (KeyError, AttributeError):
                         cls = create_exception_cls(exc_type,
                                                    celery.exceptions.__name__)
@@ -284,7 +309,7 @@ class Backend(object):
                     else:
                         exc = cls(exc_msg)
                 except Exception as err:  # noqa
-                    exc = Exception('{}({})'.format(cls, exc_msg))
+                    exc = Exception(f'{cls}({exc_msg})')
             if self.serializer in EXCEPTION_ABLE_CODECS:
                 exc = get_pickled_exception(exc)
         return exc
@@ -311,7 +336,9 @@ class Backend(object):
         return self.meta_from_decoded(self.decode(payload))
 
     def decode(self, payload):
-        payload = PY3 and payload or str(payload)
+        if payload is None:
+            return payload
+        payload = payload or str(payload)
         return loads(payload,
                      content_type=self.content_type,
                      content_encoding=self.content_encoding,
@@ -320,7 +347,7 @@ class Backend(object):
     def prepare_expires(self, value, type=None):
         if value is None:
             value = self.app.conf.result_expires
-        if isinstance(value, datetime.timedelta):
+        if isinstance(value, timedelta):
             value = value.total_seconds()
         if value is not None and type:
             return type(value)
@@ -340,13 +367,90 @@ class Backend(object):
     def is_cached(self, task_id):
         return task_id in self._cache
 
+    def _get_result_meta(self, result,
+                         state, traceback, request, format_date=True,
+                         encode=False):
+        if state in self.READY_STATES:
+            date_done = datetime.utcnow()
+            if format_date:
+                date_done = date_done.isoformat()
+        else:
+            date_done = None
+
+        meta = {
+            'status': state,
+            'result': result,
+            'traceback': traceback,
+            'children': self.current_task_children(request),
+            'date_done': date_done,
+        }
+
+        if request and getattr(request, 'group', None):
+            meta['group_id'] = request.group
+        if request and getattr(request, 'parent_id', None):
+            meta['parent_id'] = request.parent_id
+
+        if self.app.conf.find_value_for_key('extended', 'result'):
+            if request:
+                request_meta = {
+                    'name': getattr(request, 'task', None),
+                    'args': getattr(request, 'args', None),
+                    'kwargs': getattr(request, 'kwargs', None),
+                    'worker': getattr(request, 'hostname', None),
+                    'retries': getattr(request, 'retries', None),
+                    'queue': request.delivery_info.get('routing_key')
+                    if hasattr(request, 'delivery_info') and
+                    request.delivery_info else None
+                }
+
+                if encode:
+                    # args and kwargs need to be encoded properly before saving
+                    encode_needed_fields = {"args", "kwargs"}
+                    for field in encode_needed_fields:
+                        value = request_meta[field]
+                        encoded_value = self.encode(value)
+                        request_meta[field] = ensure_bytes(encoded_value)
+
+                meta.update(request_meta)
+
+        return meta
+
+    def _sleep(self, amount):
+        time.sleep(amount)
+
     def store_result(self, task_id, result, state,
                      traceback=None, request=None, **kwargs):
-        """Update task state and result."""
+        """Update task state and result.
+
+        if always_retry_backend_operation is activated, in the event of a recoverable exception,
+        then retry operation with an exponential backoff until a limit has been reached.
+        """
         result = self.encode_result(result, state)
-        self._store_result(task_id, result, state, traceback,
-                           request=request, **kwargs)
-        return result
+
+        retries = 0
+
+        while True:
+            try:
+                self._store_result(task_id, result, state, traceback,
+                                   request=request, **kwargs)
+                return result
+            except Exception as exc:
+                if self.always_retry and self.exception_safe_to_retry(exc):
+                    if retries < self.max_retries:
+                        retries += 1
+
+                        # get_exponential_backoff_interval computes integers
+                        # and time.sleep accept floats for sub second sleep
+                        sleep_amount = get_exponential_backoff_interval(
+                            self.base_sleep_between_retries_ms, retries,
+                            self.max_sleep_between_retries_ms, True) / 1000
+                        self._sleep(sleep_amount)
+                    else:
+                        raise_with_context(
+                            BackendStoreError("failed to store result on the backend", task_id=task_id, state=state),
+                        )
+                else:
+                    raise
 
     def forget(self, task_id):
         self._cache.pop(task_id, None)
@@ -378,18 +482,56 @@ class Backend(object):
 
     def _ensure_not_eager(self):
         if self.app.conf.task_always_eager:
-            raise RuntimeError(
-                "Cannot retrieve result with task_always_eager enabled")
+            warnings.warn(
+                "Shouldn't retrieve result with task_always_eager enabled.",
+                RuntimeWarning
+            )
+
+    def exception_safe_to_retry(self, exc):
+        """Check if an exception is safe to retry.
+
+        Backends have to overload this method with correct predicates dealing with their exceptions.
+
+        By default no exception is safe to retry, it's up to backend implementation
+        to define which exceptions are safe.
+        """
+        return False
 
     def get_task_meta(self, task_id, cache=True):
+        """Get task meta from backend.
+
+        if always_retry_backend_operation is activated, in the event of a recoverable exception,
+        then retry operation with an exponential backoff until a limit has been reached.
+        """
         self._ensure_not_eager()
         if cache:
             try:
                 return self._cache[task_id]
             except KeyError:
                 pass
+        retries = 0
+        while True:
+            try:
+                meta = self._get_task_meta_for(task_id)
+                break
+            except Exception as exc:
+                if self.always_retry and self.exception_safe_to_retry(exc):
+                    if retries < self.max_retries:
+                        retries += 1
 
-        meta = self._get_task_meta_for(task_id)
+                        # get_exponential_backoff_interval computes integers
+                        # and time.sleep accept floats for sub second sleep
+                        sleep_amount = get_exponential_backoff_interval(
+                            self.base_sleep_between_retries_ms, retries,
+                            self.max_sleep_between_retries_ms, True) / 1000
+                        self._sleep(sleep_amount)
+                    else:
+                        raise_with_context(
+                            BackendGetMetaError("failed to get meta", task_id=task_id),
+                        )
+                else:
+                    raise
+
         if cache and meta.get('status') == states.SUCCESS:
             self._cache[task_id] = meta
         return meta
@@ -452,10 +594,12 @@ class Backend(object):
                               **kwargs):
         kwargs['result'] = [r.as_tuple() for r in header_result]
         queue = body.options.get('queue', getattr(body.type, 'queue', None))
+        priority = body.options.get('priority', getattr(body.type, 'priority', 0))
         self.app.tasks['celery.chord_unlock'].apply_async(
             (header_result.id, body,), kwargs,
             countdown=countdown,
             queue=queue,
+            priority=priority,
         )
 
     def ensure_chords_allowed(self):
@@ -475,15 +619,23 @@ class Backend(object):
         return (unpickle_backend, (self.__class__, args, kwargs))
 
 
-class SyncBackendMixin(object):
+class SyncBackendMixin:
     def iter_native(self, result, timeout=None, interval=0.5, no_ack=True,
                     on_message=None, on_interval=None):
         self._ensure_not_eager()
         results = result.results
         if not results:
-            return iter([])
-        return self.get_many(
-            {r.id for r in results},
+            return
+
+        task_ids = set()
+        for result in results:
+            if isinstance(result, ResultSet):
+                yield result.id, result.results
+            else:
+                task_ids.add(result.id)
+
+        yield from self.get_many(
+            task_ids,
             timeout=timeout, interval=interval, no_ack=no_ack,
             on_message=on_message, on_interval=on_interval,
         )
@@ -563,7 +715,7 @@ class BaseKeyValueStoreBackend(Backend):
         if hasattr(self.key_t, '__func__'):  # pragma: no cover
             self.key_t = self.key_t.__func__  # remove binding
         self._encode_prefixes()
-        super(BaseKeyValueStoreBackend, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
         if self.implements_incr:
             self.apply_chord = self._apply_chord_incr
 
@@ -577,6 +729,9 @@ class BaseKeyValueStoreBackend(Backend):
 
     def mget(self, keys):
         raise NotImplementedError('Does not support get_many')
+
+    def _set_with_state(self, key, value, state):
+        return self.set(key, value)
 
     def set(self, key, value):
         raise NotImplementedError('Must implement the set method.')
@@ -626,18 +781,18 @@ class BaseKeyValueStoreBackend(Backend):
                 if value['status'] in READY_STATES:
                     yield k, value
 
-    def _mget_to_results(self, values, keys):
+    def _mget_to_results(self, values, keys, READY_STATES=states.READY_STATES):
         if hasattr(values, 'items'):
             # client returns dict so mapping preserved.
             return {
                 self._strip_prefix(k): v
-                for k, v in self._filter_ready(items(values))
+                for k, v in self._filter_ready(values.items(), READY_STATES)
             }
         else:
             # client returns list so need to recreate mapping.
             return {
                 bytes_to_str(keys[i]): v
-                for i, v in self._filter_ready(enumerate(values))
+                for i, v in self._filter_ready(enumerate(values), READY_STATES)
             }
 
     def get_many(self, task_ids, timeout=None, interval=0.5, no_ack=True,
@@ -662,15 +817,15 @@ class BaseKeyValueStoreBackend(Backend):
         while ids:
             keys = list(ids)
             r = self._mget_to_results(self.mget([self.get_key_for_task(k)
-                                                 for k in keys]), keys)
+                                                 for k in keys]), keys, READY_STATES)
             cache.update(r)
             ids.difference_update({bytes_to_str(v) for v in r})
-            for key, value in items(r):
+            for key, value in r.items():
                 if on_message is not None:
                     on_message(value)
                 yield bytes_to_str(key), value
             if timeout and iterations * interval >= timeout:
-                raise TimeoutError('Operation timed out ({0})'.format(timeout))
+                raise TimeoutError(f'Operation timed out ({timeout})')
             if on_interval:
                 on_interval()
             time.sleep(interval)  # don't busy loop.
@@ -683,47 +838,27 @@ class BaseKeyValueStoreBackend(Backend):
 
     def _store_result(self, task_id, result, state,
                       traceback=None, request=None, **kwargs):
+        meta = self._get_result_meta(result=result, state=state,
+                                     traceback=traceback, request=request)
+        meta['task_id'] = bytes_to_str(task_id)
 
-        if state in self.READY_STATES:
-            date_done = datetime.datetime.utcnow().isoformat()
-        else:
-            date_done = None
+        # Retrieve metadata from the backend, if the status
+        # is a success then we ignore any following update to the state.
+        # This solves a task deduplication issue because of network
+        # partitioning or lost workers. This issue involved a race condition
+        # making a lost task overwrite the last successful result in the
+        # result backend.
+        current_meta = self._get_task_meta_for(task_id)
 
-        meta = {
-            'status': state,
-            'result': result,
-            'traceback': traceback,
-            'children': self.current_task_children(request),
-            'task_id': bytes_to_str(task_id),
-            'date_done': date_done,
-        }
+        if current_meta['status'] == states.SUCCESS:
+            return result
 
-        if request and getattr(request, 'group', None):
-            meta['group_id'] = request.group
-        if request and getattr(request, 'parent_id', None):
-            meta['parent_id'] = request.parent_id
-
-        if self.app.conf.find_value_for_key('extended', 'result'):
-            if request:
-                request_meta = {
-                    'name': getattr(request, 'task', None),
-                    'args': getattr(request, 'args', None),
-                    'kwargs': getattr(request, 'kwargs', None),
-                    'worker': getattr(request, 'hostname', None),
-                    'retries': getattr(request, 'retries', None),
-                    'queue': request.delivery_info.get('routing_key')
-                    if hasattr(request, 'delivery_info') and
-                    request.delivery_info else None
-                }
-
-                meta.update(request_meta)
-
-        self.set(self.get_key_for_task(task_id), self.encode(meta))
+        self._set_with_state(self.get_key_for_task(task_id), self.encode(meta), state)
         return result
 
     def _save_group(self, group_id, result):
-        self.set(self.get_key_for_group(group_id),
-                 self.encode({'result': result.as_tuple()}))
+        self._set_with_state(self.get_key_for_group(group_id),
+                             self.encode({'result': result.as_tuple()}), states.SUCCESS)
         return result
 
     def _delete_group(self, group_id):
@@ -767,7 +902,7 @@ class BaseKeyValueStoreBackend(Backend):
             logger.exception('Chord %r raised: %r', gid, exc)
             return self.chord_error_from_stack(
                 callback,
-                ChordError('Cannot restore group: {0!r}'.format(exc)),
+                ChordError(f'Cannot restore group: {exc!r}'),
             )
         if deps is None:
             try:
@@ -777,10 +912,14 @@ class BaseKeyValueStoreBackend(Backend):
                 logger.exception('Chord callback %r raised: %r', gid, exc)
                 return self.chord_error_from_stack(
                     callback,
-                    ChordError('GroupResult {0} no longer exists'.format(gid)),
+                    ChordError(f'GroupResult {gid} no longer exists'),
                 )
         val = self.incr(key)
-        size = len(deps)
+        # Set the chord size to the value defined in the request, or fall back
+        # to the number of dependencies we can see from the restored result
+        size = request.chord.get("chord_size")
+        if size is None:
+            size = len(deps)
         if val > size:  # pragma: no cover
             logger.warning('Chord counter incremented too many times for %r',
                            gid)
@@ -808,7 +947,7 @@ class BaseKeyValueStoreBackend(Backend):
                     logger.exception('Chord %r raised: %r', gid, exc)
                     self.chord_error_from_stack(
                         callback,
-                        ChordError('Callback error: {0!r}'.format(exc)),
+                        ChordError(f'Callback error: {exc!r}'),
                     )
             finally:
                 deps.delete()

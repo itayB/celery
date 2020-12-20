@@ -1,12 +1,11 @@
-# -*- coding: utf-8 -*-
 """Distributed Task Queue."""
+# :copyright: (c) 2016-20206 Asif Saif Uddin, celery core and individual
+#                 contributors, All rights reserved.
 # :copyright: (c) 2015-2016 Ask Solem.  All rights reserved.
 # :copyright: (c) 2012-2014 GoPivotal, Inc., All rights reserved.
 # :copyright: (c) 2009 - 2012 Ask Solem and individual contributors,
 #                 All rights reserved.
 # :license:   BSD (3 Clause), see LICENSE for more details.
-
-from __future__ import absolute_import, print_function, unicode_literals
 
 import os
 import re
@@ -16,9 +15,9 @@ from collections import namedtuple
 # Lazy loading
 from . import local  # noqa
 
-SERIES = 'cliffs'
+SERIES = 'singularity'
 
-__version__ = '4.4.0rc2'
+__version__ = '5.0.5'
 __author__ = 'Ask Solem'
 __contact__ = 'auvipy@gmail.com'
 __homepage__ = 'http://celeryproject.org'
@@ -28,13 +27,13 @@ __keywords__ = 'task job queue distributed messaging actor'
 # -eof meta-
 
 __all__ = (
-    'Celery', 'bugreport', 'shared_task', 'task',
+    'Celery', 'bugreport', 'shared_task', 'task', 'Task',
     'current_app', 'current_task', 'maybe_signature',
     'chain', 'chord', 'chunks', 'group', 'signature',
     'xmap', 'xstarmap', 'uuid',
 )
 
-VERSION_BANNER = '{0} ({1})'.format(__version__, SERIES)
+VERSION_BANNER = f'{__version__} ({SERIES})'
 
 version_info_t = namedtuple('version_info_t', (
     'major', 'minor', 'micro', 'releaselevel', 'serial',
@@ -50,13 +49,13 @@ del _temp
 del re
 
 if os.environ.get('C_IMPDEBUG'):  # pragma: no cover
-    from .five import builtins
+    import builtins
 
     def debug_import(name, locals=None, globals=None,
                      fromlist=None, level=-1, real_import=builtins.__import__):
         glob = globals or getattr(sys, 'emarfteg_'[::-1])(1).f_globals
         importer_name = glob and glob.get('__name__') or 'unknown'
-        print('-- {0} imports {1}'.format(importer_name, name))
+        print(f'-- {importer_name} imports {name}')
         return real_import(name, locals, globals, fromlist, level)
     builtins.__import__ = debug_import
 
@@ -66,16 +65,15 @@ if os.environ.get('C_IMPDEBUG'):  # pragma: no cover
 STATICA_HACK = True
 globals()['kcah_acitats'[::-1].upper()] = False
 if STATICA_HACK:  # pragma: no cover
-    from celery.app import shared_task                   # noqa
-    from celery.app.base import Celery                   # noqa
-    from celery.app.utils import bugreport               # noqa
-    from celery.app.task import Task                     # noqa
     from celery._state import current_app, current_task  # noqa
-    from celery.canvas import (                          # noqa
-        chain, chord, chunks, group,
-        signature, maybe_signature, xmap, xstarmap, subtask,
-    )
-    from celery.utils import uuid                        # noqa
+    from celery.app import shared_task  # noqa
+    from celery.app.base import Celery  # noqa
+    from celery.app.task import Task  # noqa
+    from celery.app.utils import bugreport  # noqa
+    from celery.canvas import (chain, chord, chunks, group,  # noqa
+                               maybe_signature, signature, subtask, xmap,
+                               xstarmap)
+    from celery.utils import uuid  # noqa
 
 # Eventlet/gevent patching must happen before importing
 # anything else, so these tools must be at top-level.
@@ -101,7 +99,6 @@ def _find_option_with_arg(argv, short_opts=None, long_opts=None):
 
 
 def _patch_eventlet():
-    import eventlet
     import eventlet.debug
 
     eventlet.monkey_patch()
@@ -111,15 +108,10 @@ def _patch_eventlet():
 
 
 def _patch_gevent():
-    import gevent
-    from gevent import monkey, signal as gevent_signal
+    import gevent.monkey
+    import gevent.signal
 
-    monkey.patch_all()
-    if gevent.version_info[0] == 0:  # pragma: no cover
-        # Signals aren't working in gevent versions <1.0,
-        # and aren't monkey patched by patch_all()
-        _signal = __import__('signal')
-        _signal.signal = gevent_signal
+    gevent.monkey.patch_all()
 
 
 def maybe_patch_concurrency(argv=None, short_opts=None,
@@ -178,7 +170,4 @@ old_module, new_module = local.recreate_module(  # pragma: no cover
     version_info=version_info,
     maybe_patch_concurrency=maybe_patch_concurrency,
     _find_option_with_arg=_find_option_with_arg,
-    absolute_import=absolute_import,
-    unicode_literals=unicode_literals,
-    print_function=print_function,
 )

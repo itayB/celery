@@ -44,6 +44,10 @@ Say we had a task like this:
             raise self.retry(exc=exc)
 
 
+``Note``: A task being `bound <http://docs.celeryproject.org/en/latest/userguide/tasks.html#bound-tasks>`_ means the first
+argument to the task will always be the task instance (self). which means you do get a self argument as the
+first argument and can use the Task class methods and attributes.
+
 You could write unit tests for this task, using mocking like
 in this example:
 
@@ -84,13 +88,25 @@ in this example:
             with raises(Retry):
                 send_order(product.pk, 3, Decimal(30.6))
 
-Py.test
-=======
+.. _pytest_plugin:
+
+pytest
+======
 
 .. versionadded:: 4.0
 
-Celery is also a :pypi:`pytest` plugin that adds fixtures that you can
+Celery also makes a :pypi:`pytest` plugin available that adds fixtures that you can
 use in your integration (or unit) test suites.
+
+Enabling
+--------
+
+Celery initially ships the plugin in a disabled state, to enable it you can either:
+
+    * ``pip install celery[pytest]``
+    * ``pip install pytest-celery``
+    * or add an environment variable ``PYTEST_PLUGINS=celery.contrib.pytest``
+    * or add ``pytest_plugins = ("celery.contrib.pytest", )`` to your root conftest.py
 
 
 Marks
